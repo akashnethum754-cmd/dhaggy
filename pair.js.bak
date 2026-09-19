@@ -1931,6 +1931,370 @@ case 'help': {
     }
     break;
 }
+case 'tg':
+case 'telegram':
+case 'tgdl': {
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                '*කරුණාකර Telegram message URL එක ලබාදෙන්න! උදා: .tg https://t.me/dinkamovieslk/176*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const tgUrl = args.join(' ').trim();
+    const API_BASE = 'https://api.chamindu.site/api/v1/telegram/dl';
+    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
+
+    // Telegram URL validate
+    const tgMatch = tgUrl.match(/t\.me\/([a-zA-Z0-9_]+)\/(\d+)/);
+    if (!tgMatch) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ INVALID URL',
+                '*කරුණාකර වලංගු Telegram message URL එකක් ලබාදෙන්න!*\n_උදා: https://t.me/channel/123_',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    let tgListener = null;
+    let tgMasterTimeout = null;
+
+    const clearTgListeners = () => {
+        if (tgListener) {
+            socket.ev.off('messages.upsert', tgListener);
+            tgListener = null;
+        }
+        if (tgMasterTimeout) {
+            clearTimeout(tgMasterTimeout);
+            tgMasterTimeout = null;
+        }
+    };
+
+    try {
+        await socket.sendMessage(sender, { text: '🔍 Fetching Telegram file info...' }, { quoted: msg });
+
+        const infoRes = await axios.get(API_BASE, {
+            params: {
+                url: `https://t.me/${tgMatch[1]}/${tgMatch[2]}`,
+                api_key: API_KEY
+            },
+            timeout: 30000
+        });
+
+        const tgData = infoRes.data;
+
+        if (!tgData.status || !tgData.download_url) {
+            await socket.sendMessage(sender, {
+                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: formatMessage(
+                    '❌ NO DATA',
+                    '*ගොනු තොරතුරු ලබාගැනීමට නොහැකි විය!*',
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        // File type එක අනුව emoji එක
+        const getFileEmoji = (mime) => {
+            if (!mime) return '📄';
+            if (mime.startsWith('video/')) return '🎬';
+            if (mime.startsWith('audio/')) return '🎵';
+            if (mime.startsWith('image/')) return '🖼️';
+            if (mime.includes('pdf')) return '📕';
+            if (mime.includes('zip') || mime.includes('rar')) return '🗜️';
+            return '📄';
+        };
+
+        const fileEmoji = getFileEmoji(tgData.mime_type);
+        const isVideo = tgData.mime_type?.startsWith('video/');
+        const isAudio = tgData.mime_type?.startsWith('audio/');
+
+        let infoText = `${fileEmoji} *𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗙𝗜𝗟𝗘 𝗜𝗡𝗙𝗢*\n╭──────●➤\n`;
+        infoText += `*📌 Name:* ${tgData.file_name}\n`;
+        infoText += `*📦 Size:* ${tgData.file_size}\n`;
+        infoText += `*📁 Type:* ${tgData.mime_type}\n`;
+        infoText += `*📅 Date:* ${new Date(tgData.date).toLocaleString()}\n`;
+        infoText += `╰──────────●➤\n`;
+        infoText += `╭──────●➤\n*🔢 ʀᴇ𝗽ʟʏ ʙᴇʟ𝗼ᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+        infoText += `*1.* 📥 Download (File එක ලෙස එවන්න)\n`;
+        infoText += `*2.* 🔗 Direct Links (Stream + Download)\n`;
+        infoText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+        const infoMsg = await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: infoText
+        }, { quoted: msg });
+
+        const infoMsgID = infoMsg.key.id;
+
+        tgMasterTimeout = setTimeout(() => {
+            clearTgListeners();
+        }, 120000);
+
+        const handleTgSelection = async ({ messages }) => {
+            const replyMek = messages?.[0];
+            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
+
+            const text = (replyMek.message.conversation ||
+                replyMek.message.extendedTextMessage?.text || '').trim();
+            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
+
+            if (!isReply) return;
+
+            const choice = parseInt(text);
+
+            // Option 2 - Direct links විතරක් එවන්න
+            if (choice === 2) {
+                clearTgListeners();
+
+                const streamLink = tgData.stream_url;
+                const dlLink = tgData.download_url;
+
+                await socket.sendMessage(sender, {
+                    text: `${fileEmoji} *${tgData.file_name}*\n\n` +
+                          `📦 *Size:* ${tgData.file_size}\n\n` +
+                          `▶️ *STREAM LINK:*\n${streamLink}\n\n` +
+                          `📥 *DOWNLOAD LINK:*\n${dlLink}\n\n` +
+                          `> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                }, { quoted: replyMek });
+
+                await socket.sendMessage(sender, { react: { text: '✅', key: replyMek.key } });
+                return;
+            }
+
+            // Option 1 - File එක download කරලා එවන්න
+            if (choice === 1) {
+                clearTgListeners();
+
+                await socket.sendMessage(sender, { react: { text: '📥', key: replyMek.key } });
+                await socket.sendMessage(sender, {
+                    text: `⏳ *Downloading:* ${tgData.file_name}\n` +
+                          `📦 *Size:* ${tgData.file_size}\n` +
+                          `_කරුණාකර ටික වේලාවක් රැඳී සිටින්න, ගොනුව බාගත වෙමින් පවතී..._`
+                }, { quoted: replyMek });
+
+                try {
+                    // Video/Audio නම් media විදියට, නැත්නම් document විදියට
+                    if (isVideo) {
+                        await socket.sendMessage(sender, {
+                            video: { url: tgData.download_url },
+                            mimetype: tgData.mime_type || 'video/mp4',
+                            fileName: tgData.file_name,
+                            caption: `✅ *TELEGRAM DOWNLOADED*\n\n📌 *File:* ${tgData.file_name}\n📦 *Size:* ${tgData.file_size}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        }, { quoted: replyMek });
+                    } else if (isAudio) {
+                        await socket.sendMessage(sender, {
+                            audio: { url: tgData.download_url },
+                            mimetype: tgData.mime_type || 'audio/mp4',
+                            fileName: tgData.file_name,
+                            ptt: false
+                        }, { quoted: replyMek });
+                    } else {
+                        await socket.sendMessage(sender, {
+                            document: { url: tgData.download_url },
+                            mimetype: tgData.mime_type || 'application/octet-stream',
+                            fileName: tgData.file_name,
+                            caption: `✅ *TELEGRAM DOWNLOADED*\n\n📌 *File:* ${tgData.file_name}\n📦 *Size:* ${tgData.file_size}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        }, { quoted: replyMek });
+                    }
+
+                    await socket.sendMessage(sender, { react: { text: '✅', key: replyMek.key } });
+                } catch (uploadErr) {
+                    await socket.sendMessage(sender, {
+                        text: `❌ ගොනුව යැවීමේදී දෝෂයක්: ${uploadErr.message}\n\n🔗 *Direct Link:*\n${tgData.download_url}`
+                    }, { quoted: replyMek });
+                }
+                return;
+            }
+
+            // වැරදි input
+            await socket.sendMessage(sender, {
+                text: `❌ කරුණාකර *1* හෝ *2* අංකය ලබාදෙන්න!`
+            }, { quoted: replyMek });
+        };
+
+        tgListener = handleTgSelection;
+        socket.ev.on('messages.upsert', handleTgSelection);
+
+    } catch (err) {
+        clearTgListeners();
+        await socket.sendMessage(sender, {
+            text: `❌ Error: ${err.message}`
+        }, { quoted: msg });
+    }
+    break;
+}
+case 'dm':
+case 'dailymotion':
+case 'dmtv': {
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                '*කරුණාකර Dailymotion වීඩියෝ URL එක ලබාදෙන්න! උදා: .dm https://www.dailymotion.com/video/x8ac349*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const dmUrl = args.join(' ').trim();
+    const API_BASE = 'https://api.chamindu.site/api/v1/media/dailymotion/tv';
+    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
+
+    // Dailymotion URL එක validate කරනවා
+    const videoIdMatch = dmUrl.match(/dailymotion\.com\/video\/([a-zA-Z0-9]+)/);
+    if (!videoIdMatch) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ INVALID URL',
+                '*කරුණාකර වලංගු Dailymotion වීඩියෝ URL එකක් ලබාදෙන්න!*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const videoId = videoIdMatch[1];
+
+    let dmSelectionListener = null;
+    let dmMasterTimeout = null;
+
+    const clearDmListeners = () => {
+        if (dmSelectionListener) {
+            socket.ev.off('messages.upsert', dmSelectionListener);
+            dmSelectionListener = null;
+        }
+        if (dmMasterTimeout) {
+            clearTimeout(dmMasterTimeout);
+            dmMasterTimeout = null;
+        }
+    };
+
+    try {
+        await socket.sendMessage(sender, { text: '🔍 Fetching Dailymotion video info...' }, { quoted: msg });
+
+        const infoRes = await axios.get(`${API_BASE}/info`, {
+            params: {
+                url: `https://www.dailymotion.com/video/${videoId}`,
+                api_key: API_KEY
+            },
+            timeout: 20000
+        });
+
+        const infoData = infoRes.data;
+
+        if (!infoData.status || !infoData.data) {
+            await socket.sendMessage(sender, {
+                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: formatMessage(
+                    '❌ NO DATA',
+                    '*වීඩියෝ තොරතුරු ලබාගැනීමට නොහැකි විය!*',
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const video = infoData.data;
+        const downloads = video.downloads || [];
+
+        if (downloads.length === 0) {
+            await socket.sendMessage(sender, {
+                text: `❌ *${video.title}*\n\nබාගත කිරීමේ links හමු නොවීය.`
+            }, { quoted: msg });
+            break;
+        }
+
+        let listText = `🎬 *𝗗𝗔𝗜𝗟𝗬𝗠𝗢𝗧𝗜𝗢𝗡 𝗩𝗜𝗗𝗘𝗢*\n╭──────●➤\n`;
+        listText += `*📌 Title:* ${video.title}\n`;
+        listText += `*⏱️ Duration:* ${video.duration || 'N/A'}\n`;
+        listText += `*👤 Owner:* ${video.owner || 'N/A'}\n`;
+        listText += `*📺 Type:* ${video.type || 'N/A'}\n`;
+        listText += `╰──────────●➤\n`;
+        listText += `╭──────●➤\n*🔢 ʀᴇ𝗽ʟʏ ʙᴇʟ𝗼ᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+
+        downloads.forEach((dl, index) => {
+            listText += `*${index + 1}.* [${dl.quality}] ${dl.name}\n`;
+            if (dl.resolution) listText += `    ↳ ${dl.resolution}\n`;
+        });
+        listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+        const infoMsg = await socket.sendMessage(sender, {
+            image: { url: video.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: listText
+        }, { quoted: msg });
+
+        const infoMsgID = infoMsg.key.id;
+
+        dmMasterTimeout = setTimeout(() => {
+            clearDmListeners();
+        }, 120000);
+
+        const handleDmSelection = async ({ messages }) => {
+            const replyMek = messages?.[0];
+            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
+
+            const text = (replyMek.message.conversation ||
+                replyMek.message.extendedTextMessage?.text || '').trim();
+            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
+
+            if (!isReply) return;
+
+            const choice = parseInt(text) - 1;
+            if (isNaN(choice) || choice < 0 || choice >= downloads.length) {
+                await socket.sendMessage(sender, {
+                    text: `❌ කරුණාකර 1 - ${downloads.length} අතර අංකයක් ලබාදෙන්න!`
+                }, { quoted: replyMek });
+                return;
+            }
+
+            clearDmListeners();
+            const selected = downloads[choice];
+
+            await socket.sendMessage(sender, { react: { text: '📥', key: replyMek.key } });
+            await socket.sendMessage(sender, {
+                text: `⏳ *Downloading:* ${selected.name}\n_කරුණාකර ටික වේලාවක් රැඳී සිටින්න..._`
+            }, { quoted: replyMek });
+
+            try {
+                await socket.sendMessage(sender, {
+                    document: { url: selected.link },
+                    mimetype: 'video/mp4',
+                    fileName: `${video.title.replace(/[^\w\s-]/g, '')} - ${selected.quality}.mp4`,
+                    caption: `✅ *DAILYMOTION DOWNLOADED*\n\n🎬 *Title:* ${video.title}\n📌 *Quality:* ${selected.quality}\n📐 *Resolution:* ${selected.resolution || 'N/A'}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                }, { quoted: replyMek });
+
+                await socket.sendMessage(sender, { react: { text: '✅', key: replyMek.key } });
+            } catch (uploadErr) {
+                await socket.sendMessage(sender, {
+                    text: `❌ වීඩියෝව යැවීමේදී දෝෂයක්: ${uploadErr.message}\n\n🔗 Direct Link:\n${selected.link}`
+                }, { quoted: replyMek });
+            }
+        };
+
+        dmSelectionListener = handleDmSelection;
+        socket.ev.on('messages.upsert', handleDmSelection);
+
+    } catch (err) {
+        clearDmListeners();
+        await socket.sendMessage(sender, {
+            text: `❌ Error: ${err.message}`
+        }, { quoted: msg });
+    }
+    break;
+}
 // ==========================================
 // DINKAMOVIES - SHAGGY XMD (GDrive + Direct)
 // ==========================================
