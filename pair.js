@@ -2529,8 +2529,6 @@ case 'dailymotion': {
     }
 }
 break
-
-}
 case 'papers':
 case 'paper':
 case 'pastpapers': {
