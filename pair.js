@@ -1324,12 +1324,11 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
                 `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
             )
-        }, { quoted: msg });
+      }, { quoted: msg });
     }
     break;
-         
-            }
-   case 'menu':
+
+    break  case 'menu':
 case 'help': {
     try {
         const pushName = msg.pushName || 'User';
