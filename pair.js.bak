@@ -1711,7 +1711,8 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
-}
+
+            }                    
 case 'singrup':
     if (!args.length || !args.join(' ').includes(',')) {
         await socket.sendMessage(sender, {
