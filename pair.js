@@ -1143,7 +1143,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
 
                 } else {
                     await socket.sendMessage(sender, { 
-                        text: '📽️ 𝙁𝙚𝙩??𝙝𝙞𝙣𝙜 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...' 
+                        text: '📽️ 𝙁𝙚𝙩????𝙞𝙣𝙜 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...' 
                     }, { quoted: replyMek });
 
                     try {
@@ -1712,7 +1712,225 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
     }
     break;
 
-            }                    
+    break;    case 'menu':
+case 'help': {
+    try {
+        const pushName = msg.pushName || 'User';
+        const date = new Date();
+        const slstDate = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Colombo" }));
+        const formattedDate = `${slstDate.getFullYear()}/${slstDate.getMonth() + 1}/${slstDate.getDate()}`;
+        const formattedTime = slstDate.toLocaleTimeString();
+        const hour = slstDate.getHours();
+
+        const greetings = hour < 12 ? `Good Morning✨` :
+                          hour < 15 ? `Good Afternoon🚀` :
+                          hour < 18 ? `Good Evening! 🌟` : `Good Night🌙`;
+
+        const mainMenuMsg =
+`*🌟 𝙃𝙚𝙮 ❟ ${pushName} ✨*
+*🍟 Wᴇʟᴄᴏᴍᴇ ᴛᴏ SHAGGY XMD 🦊*
+*╭─「 ꜱᴛᴀᴛᴜꜱ ᴘᴀɴᴇʟ」*
+*┃ \`🔮 ${greetings}\`*
+*┃ \`⏰ 𝚃𝚒𝚖𝚎\` : ${formattedTime}*
+*┃ \`📆 𝙳𝚊𝚝𝚎\` : ${formattedDate}*
+*┃ \`🎃 𝙱𝚘𝚝 𝙽𝚊𝚖𝚎:\` SHAGGY-XMD*
+*┃ \`📟 𝙿𝚕𝚊𝚝𝚏𝚘𝚛𝚖:\` Linux*
+*╰────────●●►*
+*☱ 🔢 𝚁𝙴𝙿𝙻𝚈 𝚆𝙸𝚃𝙷 𝙽𝚄𝙼𝙱𝙴𝚁 ☱*
+
+*1 ❯❯  𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*
+*2 ❯❯  𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*
+*3 ❯❯  𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*
+*4 ❯❯  𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*
+*5 ❯❯  𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*
+*6 ❯❯  𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*
+
+> SHAGGY XMD ✘ ᴀɪʀ Bᴏᴛ ᴠ2
+> _Crafted by Shaggy Ofc_
+> 🐥 _Web: https://shaggytech.online`;
+
+        const sentMsg = await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: mainMenuMsg
+        }, { quoted: msg });
+
+        const menuMsgID = sentMsg.key.id;
+        const originalSender = (msg.key.participant || msg.key.remoteJid || '').split('@')[0].split(':')[0];
+
+        // ── Menu categories ──
+        const menus = {
+            '1': {
+                title: `*🔍 𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*`,
+                body:
+`╭─「 🔍 ꜱᴇᴀʀᴄʜ ᴄᴍᴅꜱ 」*
+  • .cinesubz    — Movie search
+  • .sinhalasub  — Movie search
+  • .cinetv      — TV Series
+  • .movie       — Multi source
+  • .thinkiri    — TheNkiri
+  • .chithrapata — Chithrapata
+  • .anime       — Anime search
+  • .cartoon     — Cartoon search
+  • .
+       — DinkaMovies
+  • .cinemx      — CineMovie
+  • .cartoon2  ----- cartoon dl
+  • .moviemania       — Moviedl
+  • .pupilmovie  — Movie search
+  • .wre    — WWE search
+  • .sinhalatop  — Sub search
+  • .rexporn     — Adult search
+  • .apk         — Mod APK search
+  • .rom         — Game ROM search
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            },
+            '2': {
+                title: `*⬇️ 𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*`,
+                body:
+`╭─「 ⬇️ ᴅᴏᴡɴʟᴏᴀᴅ ᴄᴍᴅꜱ 」*
+  • .song        — Music dl
+  • .tiktok      — TikTok dl
+  • .sdl         — Status vid dl
+  • .vv          — View once
+  • .ai          — AI chat
+  • .schedule    — Custom msg
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            },
+            '3': {
+                title: `*🎬 𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*`,
+                body:
+`╭─「 🎬 ᴍᴏᴠɪᴇ ᴄᴍᴅꜱ 」*
+  • .cinesubz    — Sinhala sub
+  • .sinhalasub  — Sinhala sub
+  • .cinetv      — TV Series
+  • .movie       — Multi source
+  • .subzlk      — Movie dl
+  • moviesubzlk       — Multi source
+  • .moviemania  — Multi source
+  • .zoom        - Multi source
+  • .thinkiri    — TheNkiri
+  • .chithrapata — Chithrapata
+  • .dika       — Movies
+  • .pupilmovie  — PupilVideo
+  • .cartoon     — Cartoons.lk
+  • .anime       — AnimeHeaven
+  • .dubzone     — DubZone
+  • .wrestling  — WatchWrestling
+  • .sinhalatop  — SinhalaTop
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            },
+            '4': {
+                title: `*📱 𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*`,
+                body:
+`╭─ 「 📱 ᴀᴘᴘꜱ & ɢᴀᴍᴇꜱ 」*
+  • .apk         — Mod APK dl
+  • .rom         — Game ROM dl
+  • .hexrom      — ROM (alias)
+  • .game        — ROM (alias)
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            },
+            '5': {
+                title: `*⚙️ 𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*`,
+                body:
+`╭─「 ⚙️ ɢᴇɴᴇʀᴀʟ ᴄᴍᴅꜱ 」*
+  • .alive       — Bot status
+  • .menu        — Command menu
+  • .help        — Same as menu
+  • .system      — System info
+  • .ping        — Ping info
+  • .bots        — Active sessions
+  • .jid         — Get chat JID
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            },
+            '6': {
+                title: `*👑 𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*`,
+                body:
+`╭─「 👑 ᴀᴅᴍɪɴ ᴄᴍᴅꜱ 」*
+  • .set         — Settings panel
+  • .adauto      — Add auto reply
+  • .delauto     — Delete auto reply
+  • .autorep     — Auto reply list
+  • .pair        — Generate pair code
+  • .reset       — Reset session
+  • .restart     — Restart bot
+  • .stop        — Stop bot
+  • .sessions    — Active sessions
+╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
+
+⚠️ *Admin only commands*
+
+*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+            }
+        };
+
+        // ── Reply listener ──
+        const handleMenuReply = async ({ messages: replyMsgs }) => {
+            const replyMek = replyMsgs?.[0];
+            if (!replyMek?.message) return;
+
+            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
+            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === menuMsgID;
+            const replier = (replyMek.key.participant || replyMek.key.remoteJid || '').split('@')[0].split(':')[0];
+
+            if (!isReply || replier !== originalSender) return;
+
+            // ─── Back to main (0) ───
+            if (text === '0') {
+                return socket.sendMessage(sender, {
+                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    caption: mainMenuMsg
+                }, { quoted: replyMek });
+            }
+
+            // ─── Main menu (6) ───
+            if (text === '6') {
+                return socket.sendMessage(sender, {
+                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    caption: mainMenuMsg
+                }, { quoted: replyMek });
+            }
+
+            // ─── Category menu (1-5) ───
+            const menu = menus[text];
+            if (menu) {
+                // Admin check for menu 6
+                if (text === '6') {
+                    const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
+                    if (!isOwner && !ADMIN_NUMBERS.includes(senderNumber)) {
+                        return socket.sendMessage(sender, {
+                            text: `❌ *Admin only!*`
+                        }, { quoted: replyMek });
+                    }
+                }
+                
+                await socket.sendMessage(sender, {
+                    text: `${menu.title}\n\n${menu.body}`
+                }, { quoted: replyMek });
+            }
+        };
+
+        socket.ev.on('messages.upsert', handleMenuReply);
+
+        // ── Auto cleanup after 2 min ──
+        setTimeout(() => {
+            socket.ev.off('messages.upsert', handleMenuReply);
+        }, 120000);
+
+    } catch (e) {
+        console.error('Menu error:', e.message);
+    }
+    break;
+}
 case 'singrup':
     if (!args.length || !args.join(' ').includes(',')) {
         await socket.sendMessage(sender, {
@@ -2089,602 +2307,230 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
-
-    break;    case 'menu':
-case 'help': {
-    try {
-        const pushName = msg.pushName || 'User';
-        const date = new Date();
-        const slstDate = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Colombo" }));
-        const formattedDate = `${slstDate.getFullYear()}/${slstDate.getMonth() + 1}/${slstDate.getDate()}`;
-        const formattedTime = slstDate.toLocaleTimeString();
-        const hour = slstDate.getHours();
-
-        const greetings = hour < 12 ? `Good Morning✨` :
-                          hour < 15 ? `Good Afternoon🚀` :
-                          hour < 18 ? `Good Evening! 🌟` : `Good Night🌙`;
-
-        const mainMenuMsg =
-`*🌟 𝙃𝙚𝙮 ❟ ${pushName} ✨*
-*🍟 Wᴇʟᴄᴏᴍᴇ ᴛᴏ SHAGGY XMD 🦊*
-*╭─「 ꜱᴛᴀᴛᴜꜱ ᴘᴀɴᴇʟ」*
-*┃ \`🔮 ${greetings}\`*
-*┃ \`⏰ 𝚃𝚒𝚖𝚎\` : ${formattedTime}*
-*┃ \`📆 𝙳𝚊𝚝𝚎\` : ${formattedDate}*
-*┃ \`🎃 𝙱𝚘𝚝 𝙽𝚊𝚖𝚎:\` SHAGGY-XMD*
-*┃ \`📟 𝙿𝚕𝚊𝚝𝚏𝚘𝚛𝚖:\` Linux*
-*╰────────●●►*
-*☱ 🔢 𝚁𝙴𝙿𝙻𝚈 𝚆𝙸𝚃𝙷 𝙽𝚄𝙼𝙱𝙴𝚁 ☱*
-
-*1 ❯❯  𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*
-*2 ❯❯  𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*
-*3 ❯❯  𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*
-*4 ❯❯  𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*
-*5 ❯❯  𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*
-*6 ❯❯  𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*
-
-> SHAGGY XMD ✘ ᴀɪʀ Bᴏᴛ ᴠ2
-> _Crafted by Shaggy Ofc_
-> 🐥 _Web: https://shaggytech.online`;
-
-        const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: mainMenuMsg
-        }, { quoted: msg });
-
-        const menuMsgID = sentMsg.key.id;
-        const originalSender = (msg.key.participant || msg.key.remoteJid || '').split('@')[0].split(':')[0];
-
-        // ── Menu categories ──
-        const menus = {
-            '1': {
-                title: `*🔍 𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 🔍 ꜱᴇᴀʀᴄʜ ᴄᴍᴅꜱ 」*
-  • .cinesubz    — Movie search
-  • .sinhalasub  — Movie search
-  • .cinetv      — TV Series
-  • .movie       — Multi source
-  • .thinkiri    — TheNkiri
-  • .chithrapata — Chithrapata
-  • .anime       — Anime search
-  • .cartoon     — Cartoon search
-  • .
-       — DinkaMovies
-  • .cinemx      — CineMovie
-  • .cartoon2  ----- cartoon dl
-  • .moviemania       — Moviedl
-  • .pupilmovie  — Movie search
-  • .wre    — WWE search
-  • .sinhalatop  — Sub search
-  • .rexporn     — Adult search
-  • .apk         — Mod APK search
-  • .rom         — Game ROM search
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            },
-            '2': {
-                title: `*⬇️ 𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 ⬇️ ᴅᴏᴡɴʟᴏᴀᴅ ᴄᴍᴅꜱ 」*
-  • .song        — Music dl
-  • .tiktok      — TikTok dl
-  • .sdl         — Status vid dl
-  • .vv          — View once
-  • .ai          — AI chat
-  • .schedule    — Custom msg
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            },
-            '3': {
-                title: `*🎬 𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 🎬 ᴍᴏᴠɪᴇ ᴄᴍᴅꜱ 」*
-  • .cinesubz    — Sinhala sub
-  • .sinhalasub  — Sinhala sub
-  • .cinetv      — TV Series
-  • .movie       — Multi source
-  • .subzlk      — Movie dl
-  • moviesubzlk       — Multi source
-  • .moviemania  — Multi source
-  • .zoom        - Multi source
-  • .thinkiri    — TheNkiri
-  • .chithrapata — Chithrapata
-  • .dika       — Movies
-  • .pupilmovie  — PupilVideo
-  • .cartoon     — Cartoons.lk
-  • .anime       — AnimeHeaven
-  • .dubzone     — DubZone
-  • .wrestling  — WatchWrestling
-  • .sinhalatop  — SinhalaTop
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            },
-            '4': {
-                title: `*📱 𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*`,
-                body:
-`╭─ 「 📱 ᴀᴘᴘꜱ & ɢᴀᴍᴇꜱ 」*
-  • .apk         — Mod APK dl
-  • .rom         — Game ROM dl
-  • .hexrom      — ROM (alias)
-  • .game        — ROM (alias)
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            },
-            '5': {
-                title: `*⚙️ 𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 ⚙️ ɢᴇɴᴇʀᴀʟ ᴄᴍᴅꜱ 」*
-  • .alive       — Bot status
-  • .menu        — Command menu
-  • .help        — Same as menu
-  • .system      — System info
-  • .ping        — Ping info
-  • .bots        — Active sessions
-  • .jid         — Get chat JID
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            },
-            '6': {
-                title: `*👑 𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 👑 ᴀᴅᴍɪɴ ᴄᴍᴅꜱ 」*
-  • .set         — Settings panel
-  • .adauto      — Add auto reply
-  • .delauto     — Delete auto reply
-  • .autorep     — Auto reply list
-  • .pair        — Generate pair code
-  • .reset       — Reset session
-  • .restart     — Restart bot
-  • .stop        — Stop bot
-  • .sessions    — Active sessions
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-⚠️ *Admin only commands*
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
-            }
-        };
-
-        // ── Reply listener ──
-        const handleMenuReply = async ({ messages: replyMsgs }) => {
-            const replyMek = replyMsgs?.[0];
-            if (!replyMek?.message) return;
-
-            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === menuMsgID;
-            const replier = (replyMek.key.participant || replyMek.key.remoteJid || '').split('@')[0].split(':')[0];
-
-            if (!isReply || replier !== originalSender) return;
-
-            // ─── Back to main (0) ───
-            if (text === '0') {
-                return socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: mainMenuMsg
-                }, { quoted: replyMek });
-            }
-
-            // ─── Main menu (6) ───
-            if (text === '6') {
-                return socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: mainMenuMsg
-                }, { quoted: replyMek });
-            }
-
-            // ─── Category menu (1-5) ───
-            const menu = menus[text];
-            if (menu) {
-                // Admin check for menu 6
-                if (text === '6') {
-                    const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
-                    if (!isOwner && !ADMIN_NUMBERS.includes(senderNumber)) {
-                        return socket.sendMessage(sender, {
-                            text: `❌ *Admin only!*`
-                        }, { quoted: replyMek });
-                    }
-                }
-                
-                await socket.sendMessage(sender, {
-                    text: `${menu.title}\n\n${menu.body}`
-                }, { quoted: replyMek });
-            }
-        };
-
-        socket.ev.on('messages.upsert', handleMenuReply);
-
-        // ── Auto cleanup after 2 min ──
-        setTimeout(() => {
-            socket.ev.off('messages.upsert', handleMenuReply);
-        }, 120000);
-
-    } catch (e) {
-        console.error('Menu error:', e.message);
-    }
-    break;
-}
-case 'tg':
-case 'telegram':
-case 'tgdl': {
-    if (!args.length) {
-        await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: formatMessage(
-                '❌ ERROR',
-                '*කරුණාකර Telegram message URL එක ලබාදෙන්න! උදා: .tg https://t.me/dinkamovieslk/176*',
-                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-            )
-        }, { quoted: msg });
-        break;
-    }
-
-    const tgUrl = args.join(' ').trim();
-    const API_BASE = 'https://api.chamindu.site/api/v1/telegram/dl';
-    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
-
-    // Telegram URL validate
-    const tgMatch = tgUrl.match(/t\.me\/([a-zA-Z0-9_]+)\/(\d+)/);
-    if (!tgMatch) {
-        await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: formatMessage(
-                '❌ INVALID URL',
-                '*කරුණාකර වලංගු Telegram message URL එකක් ලබාදෙන්න!*\n_උදා: https://t.me/channel/123_',
-                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-            )
-        }, { quoted: msg });
-        break;
-    }
-
-    let tgListener = null;
-    let tgMasterTimeout = null;
-
-    const clearTgListeners = () => {
-        if (tgListener) {
-            socket.ev.off('messages.upsert', tgListener);
-            tgListener = null;
-        }
-        if (tgMasterTimeout) {
-            clearTimeout(tgMasterTimeout);
-            tgMasterTimeout = null;
-        }
-    };
-
-    try {
-        await socket.sendMessage(sender, { text: '🔍 Fetching Telegram file info...' }, { quoted: msg });
-
-        const infoRes = await axios.get(API_BASE, {
-            params: {
-                url: `https://t.me/${tgMatch[1]}/${tgMatch[2]}`,
-                api_key: API_KEY
-            },
-            timeout: 30000
-        });
-
-        const tgData = infoRes.data;
-
-        if (!tgData.status || !tgData.download_url) {
-            await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: formatMessage(
-                    '❌ NO DATA',
-                    '*ගොනු තොරතුරු ලබාගැනීමට නොහැකි විය!*',
-                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                )
-            }, { quoted: msg });
-            break;
-        }
-
-        // File type එක අනුව emoji එක
-        const getFileEmoji = (mime) => {
-            if (!mime) return '📄';
-            if (mime.startsWith('video/')) return '🎬';
-            if (mime.startsWith('audio/')) return '🎵';
-            if (mime.startsWith('image/')) return '🖼️';
-            if (mime.includes('pdf')) return '📕';
-            if (mime.includes('zip') || mime.includes('rar')) return '🗜️';
-            return '📄';
-        };
-
-        const fileEmoji = getFileEmoji(tgData.mime_type);
-        const isVideo = tgData.mime_type?.startsWith('video/');
-        const isAudio = tgData.mime_type?.startsWith('audio/');
-
-        let infoText = `${fileEmoji} *𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗙𝗜𝗟𝗘 𝗜𝗡𝗙𝗢*\n╭──────●➤\n`;
-        infoText += `*📌 Name:* ${tgData.file_name}\n`;
-        infoText += `*📦 Size:* ${tgData.file_size}\n`;
-        infoText += `*📁 Type:* ${tgData.mime_type}\n`;
-        infoText += `*📅 Date:* ${new Date(tgData.date).toLocaleString()}\n`;
-        infoText += `╰──────────●➤\n`;
-        infoText += `╭──────●➤\n*🔢 ʀᴇ𝗽ʟʏ ʙᴇʟ𝗼ᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
-        infoText += `*1.* 📥 Download (File එක ලෙස එවන්න)\n`;
-        infoText += `*2.* 🔗 Direct Links (Stream + Download)\n`;
-        infoText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
-
-        const infoMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: infoText
-        }, { quoted: msg });
-
-        const infoMsgID = infoMsg.key.id;
-
-        tgMasterTimeout = setTimeout(() => {
-            clearTgListeners();
-        }, 120000);
-
-        const handleTgSelection = async ({ messages }) => {
-            const replyMek = messages?.[0];
-            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-
-            const text = (replyMek.message.conversation ||
-                replyMek.message.extendedTextMessage?.text || '').trim();
-            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
-
-            if (!isReply) return;
-
-            const choice = parseInt(text);
-
-            // Option 2 - Direct links විතරක් එවන්න
-            if (choice === 2) {
-                clearTgListeners();
-
-                const streamLink = tgData.stream_url;
-                const dlLink = tgData.download_url;
-
-                await socket.sendMessage(sender, {
-                    text: `${fileEmoji} *${tgData.file_name}*\n\n` +
-                          `📦 *Size:* ${tgData.file_size}\n\n` +
-                          `▶️ *STREAM LINK:*\n${streamLink}\n\n` +
-                          `📥 *DOWNLOAD LINK:*\n${dlLink}\n\n` +
-                          `> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                }, { quoted: replyMek });
-
-                await socket.sendMessage(sender, { react: { text: '✅', key: replyMek.key } });
-                return;
-            }
-
-            // Option 1 - File එක download කරලා එවන්න
-            if (choice === 1) {
-                clearTgListeners();
-
-                await socket.sendMessage(sender, { react: { text: '📥', key: replyMek.key } });
-                await socket.sendMessage(sender, {
-                    text: `⏳ *Downloading:* ${tgData.file_name}\n` +
-                          `📦 *Size:* ${tgData.file_size}\n` +
-                          `_කරුණාකර ටික වේලාවක් රැඳී සිටින්න, ගොනුව බාගත වෙමින් පවතී..._`
-                }, { quoted: replyMek });
-
-                try {
-                    // Video/Audio නම් media විදියට, නැත්නම් document විදියට
-                    if (isVideo) {
-                        await socket.sendMessage(sender, {
-                            video: { url: tgData.download_url },
-                            mimetype: tgData.mime_type || 'video/mp4',
-                            fileName: tgData.file_name,
-                            caption: `✅ *TELEGRAM DOWNLOADED*\n\n📌 *File:* ${tgData.file_name}\n📦 *Size:* ${tgData.file_size}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                        }, { quoted: replyMek });
-                    } else if (isAudio) {
-                        await socket.sendMessage(sender, {
-                            audio: { url: tgData.download_url },
-                            mimetype: tgData.mime_type || 'audio/mp4',
-                            fileName: tgData.file_name,
-                            ptt: false
-                        }, { quoted: replyMek });
-                    } else {
-                        await socket.sendMessage(sender, {
-                            document: { url: tgData.download_url },
-                            mimetype: tgData.mime_type || 'application/octet-stream',
-                            fileName: tgData.file_name,
-                            caption: `✅ *TELEGRAM DOWNLOADED*\n\n📌 *File:* ${tgData.file_name}\n📦 *Size:* ${tgData.file_size}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                        }, { quoted: replyMek });
-                    }
-
-                    await socket.sendMessage(sender, { react: { text: '✅', key: replyMek.key } });
-                } catch (uploadErr) {
-                    await socket.sendMessage(sender, {
-                        text: `❌ ගොනුව යැවීමේදී දෝෂයක්: ${uploadErr.message}\n\n🔗 *Direct Link:*\n${tgData.download_url}`
-                    }, { quoted: replyMek });
-                }
-                return;
-            }
-
-            // වැරදි input
-            await socket.sendMessage(sender, {
-                text: `❌ කරුණාකර *1* හෝ *2* අංකය ලබාදෙන්න!`
-            }, { quoted: replyMek });
-        };
-
-        tgListener = handleTgSelection;
-        socket.ev.on('messages.upsert', handleTgSelection);
-
-    } catch (err) {
-        clearTgListeners();
-        await socket.sendMessage(sender, {
-            text: `❌ Error: ${err.message}`
-        }, { quoted: msg });
-    }
-    break;
 }
 case 'dm':
-case 'dailymotion':
-case 'dmtv': {
-    if (!args.length) {
-        await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: formatMessage(
-                '❌ ERROR',
-                `*කරුණාකර Dailymotion URL එකක් හෝ වීඩියෝ නමක් ලබාදෙන්න!*\n\n*උදාහරණ:*\n• \`.dm https://www.dailymotion.com/video/x8ac349\`\n• \`.dm https://dai.ly/x8ac349\`\n• \`.dm x8ac349 720p\`\n• \`.dm Prema Dadayama 46\``,
-                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+case 'dailymotion': {
+    try {
+        const apiKey = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9'
+
+        if (!q) {
+            return reply(
+                `╭━━━〔 🎬 DAILYMOTION 〕━━━╮\n` +
+                `┃\n` +
+                `┃ ❌ Please enter a search query.\n` +
+                `┃\n` +
+                `┃ Example:\n` +
+                `┃ .dm Prema Dadayama\n` +
+                `┃ .dm WWE\n` +
+                `┃ .dm Sinhala Teledrama\n` +
+                `┃\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
             )
-        }, { quoted: msg });
-        break;
-    }
-
-    const API_BASE = 'https://api.chamindu.site/api/v1/dailymotion';
-    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
-
-    const rawInput = args.join(' ').trim();
-
-    // Loading reaction එකක් යවනවා
-    try {
-        await socket.sendMessage(sender, { react: { text: '⏳', key: msg.key } });
-    } catch (e) {}
-
-    try {
-        let videoTarget = null;
-        let requestedQuality = null;
-
-        // URL එකක් හෝ Video ID එකක්දැයි පරීක්ෂා කිරීම
-        const urlMatch = rawInput.match(/(?:dailymotion\.com\/(?:video|embed\/video)\/|dai\.ly\/|^)([a-zA-Z0-9]{6,10})/i);
-        const qualityMatch = rawInput.match(/\b(1080p?|720p?|480p?|380p?|240p?)\b/i);
-
-        if (qualityMatch) {
-            requestedQuality = qualityMatch[1].toLowerCase().replace('p', '') + 'p';
         }
 
-        if (urlMatch && (rawInput.includes('dailymotion.com') || rawInput.includes('dai.ly') || /^[a-zA-Z0-9]{6,10}$/.test(rawInput.split(' ')[0]))) {
-            videoTarget = urlMatch[1];
-        } else {
-            // URL එකක් නොවේ නම් Search කර පළමු වීඩියෝව තෝරාගැනීම
-            const searchRes = await axios.get(`${API_BASE}/search`, {
-                params: { q: rawInput, limit: 5, api_key: API_KEY },
-                timeout: 15000
-            });
+        // =========================================================
+        // RESULT SELECT
+        // .dm 1
+        // =========================================================
+        if (/^\d+$/.test(q.trim())) {
 
-            if (searchRes.data && searchRes.data.status && searchRes.data.data && searchRes.data.data.length > 0) {
-                videoTarget = searchRes.data.data[0].id || searchRes.data.data[0].link;
-            } else {
-                await socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: formatMessage(
-                        '❌ NOT FOUND',
-                        `*සමාවන්න, '${rawInput}' සඳහා කිසිදු Dailymotion වීඩියෝවක් සොයාගත නොහැකි විය!*`,
-                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                    )
-                }, { quoted: msg });
-                break;
+            const index = parseInt(q.trim()) - 1
+
+            global.dailymotionSearch =
+                global.dailymotionSearch || {}
+
+            const results =
+                global.dailymotionSearch[m.sender] ||
+                global.dailymotionSearch[m.from]
+
+            if (!results || !results[index]) {
+                return reply(
+                    `╭━━━〔 ❌ ERROR 〕━━━╮\n` +
+                    `┃\n` +
+                    `┃ Result එක හම්බුනේ නැහැ.\n` +
+                    `┃\n` +
+                    `┃ මුලින් search කරන්න:\n` +
+                    `┃ .dm Prema Dadayama\n` +
+                    `┃\n` +
+                    `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+                )
             }
-        }
 
-        // වීඩියෝ තොරතුරු සහ Download Links ලබාගැනීම
-        const infoRes = await axios.get(`${API_BASE}/infodl`, {
-            params: { url: videoTarget, api_key: API_KEY },
-            timeout: 20000
-        });
+            const selected = results[index]
 
-        if (!infoRes.data || !infoRes.data.status || !infoRes.data.data) {
-            await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: formatMessage(
-                    '❌ ERROR',
-                    '*වීඩියෝ තොරතුරු ලබාගැනීමට නොහැකි විය. වීඩියෝව Private හෝ ඉවත් කර ඇති එකක් විය හැක.*',
-                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                )
-            }, { quoted: msg });
-            break;
-        }
-
-        const video = infoRes.data.data;
-        const downloads = video.downloads || [];
-
-        if (!downloads.length) {
-            await socket.sendMessage(sender, {
-                image: { url: video.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: formatMessage(
-                    '❌ NO DOWNLOADS',
-                    `*සමාවන්න, මෙම වීඩියෝව සඳහා ඍජු download streams සොයාගත නොහැකි විය.*`,
-                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                )
-            }, { quoted: msg });
-            break;
-        }
-
-        // පරිශීලකයා ඉල්ලූ Quality එක හෝ Best Quality තෝරාගැනීම
-        let selectedDl = downloads[0];
-        if (requestedQuality) {
-            const found = downloads.find(d => d.quality && d.quality.toLowerCase().includes(requestedQuality));
-            if (found) selectedDl = found;
-        }
-
-        // File නම clean කිරීම
-        const safeTitle = (video.title || 'Dailymotion_Video')
-            .replace(/[/\\?%*:|"<>]/g, '_')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 80);
-        const fileName = `${safeTitle} [${selectedDl.quality || 'HD'}].mp4`;
-
-        // Uploading Status Reaction
-        try {
-            await socket.sendMessage(sender, { react: { text: '📥', key: msg.key } });
-        } catch (e) {}
-
-        // WhatsApp 2 GB Document Mode එකෙන් Upload කිරීමට උත්සාහ කිරීම
-        try {
-            await socket.sendMessage(sender, {
-                document: { url: selectedDl.link },
-                mimetype: 'video/mp4',
-                fileName: fileName,
-                caption: `🎬 *${video.title}*\n\n⏱️ *කාලය:* ${video.duration || 'N/A'}\n👤 *Creator:* ${video.owner || 'Dailymotion'}\n📊 *Quality:* ${selectedDl.quality} (${selectedDl.resolution || 'Direct MP4'})\n📦 *Mode:* High Quality Document (Max 2 GB)\n\n${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-            }, { quoted: msg });
-
-            // සාර්ථක වූ විට Done Reaction
-            try {
-                await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
-            } catch (e) {}
-
-        } catch (uploadError) {
-            console.error('[Dailymotion Upload Error - Switching to Fallback]:', uploadError?.message || uploadError);
-
-            // ⚠️ LARGE FILE FALLBACK:
-            // WhatsApp එකට upload වීමට නොහැකි වූ විට High-Speed Direct Download Link එක යැවීම
-            const allLinksFormatted = downloads.map(d => `🔹 *${d.quality} (${d.resolution || 'MP4'}):*\n🔗 ${d.link}`).join('\n\n');
-
-            await socket.sendMessage(sender, {
-                image: { url: video.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: formatMessage(
-                    '⚡ DIRECT DOWNLOAD LINK',
-                    `⚠️ *WhatsApp හරහා File එක direct upload කිරීමට නොහැකි විය (File Size එක WhatsApp සීමාව ඉක්මවා යාම හෝ Network හේතුවෙන්).*
-
-🎬 *නම:* ${video.title}
-⏱️ *කාලය:* ${video.duration || 'N/A'}
-👤 *Owner:* ${video.owner || 'Dailymotion'}
-🎯 *තෝරාගත් Quality:* ${selectedDl.quality}
-
-⬇️ *High-Speed Direct Download Link (1-Click / IDM):*
-${selectedDl.link}
-
-📂 *අනෙකුත් Quality Links:*
-${allLinksFormatted}
-
-💡 *ඉහත Link එක Click කර Chrome/Browser එකෙන් හෝ IDM මඟින් උපරිම වේගයෙන් Download කරගත හැක (2 GB+ වුවද ක්‍රියා කරයි).*`,
-                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                )
-            }, { quoted: msg });
-
-            try {
-                await socket.sendMessage(sender, { react: { text: '⚡', key: msg.key } });
-            } catch (e) {}
-        }
-
-    } catch (err) {
-        console.error('[Dailymotion Command Error]:', err);
-        await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: formatMessage(
-                '❌ ERROR',
-                `*දෝෂයක් සිදුවිය:* ${err.response?.data?.detail || err.message || 'API Server Error'}`,
-                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            await reply(
+                `╭━━━〔 ⏳ DAILYMOTION 〕━━━╮\n` +
+                `┃\n` +
+                `┃ 🎬 ${selected.title}\n` +
+                `┃\n` +
+                `┃ 🔎 Getting video information...\n` +
+                `┃\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
             )
-        }, { quoted: msg });
+
+            // =====================================================
+            // VIDEO INFO
+            // =====================================================
+
+            const videoUrl =
+                encodeURIComponent(selected.link)
+
+            const infoUrl =
+                `https://api.chamindu.site/api/v1/media/dailymotion/tv/info?url=${videoUrl}&api_key=${apiKey}`
+
+            const response =
+                await fetch(infoUrl)
+
+            const result =
+                await response.json()
+
+            if (!result.status || !result.data) {
+                return reply(
+                    `❌ Video information ලබාගන්න බැරි වුණා.`
+                )
+            }
+
+            const data = result.data
+
+            let text =
+                `╭━━━〔 🎬 DAILYMOTION VIDEO 〕━━━╮\n` +
+                `┃\n` +
+                `┃ 🎬 ${data.title}\n` +
+                `┃\n` +
+                `┃ 🆔 ${data.id}\n` +
+                `┃ 👤 ${data.owner}\n` +
+                `┃ ⏱️ ${data.duration}\n` +
+                `┃ 🎞️ ${data.type}\n` +
+                `┃\n` +
+                `┃ 📥 DOWNLOAD LINKS\n`
+
+            if (data.downloads && data.downloads.length) {
+
+                data.downloads.forEach((item, i) => {
+
+                    text +=
+                        `┃\n` +
+                        `┃ ${i + 1}. 📺 ${item.quality}\n` +
+                        `┃ 📐 ${item.resolution}\n` +
+                        `┃ 🔗 ${item.link}\n`
+
+                })
+
+            } else {
+
+                text +=
+                    `┃\n` +
+                    `┃ ❌ Download links unavailable\n`
+
+            }
+
+            text +=
+                `┃\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n` +
+                `⚡ *CHAMINDU OFC*`
+
+            return reply(text)
+        }
+
+        // =========================================================
+        // SEARCH
+        // .dm Prema Dadayama
+        // =========================================================
+
+        const searchQuery =
+            encodeURIComponent(q.trim())
+
+        const searchUrl =
+            `https://api.chamindu.site/api/v1/media/dailymotion/tv/search?q=${searchQuery}&api_key=${apiKey}`
+
+        const response =
+            await fetch(searchUrl)
+
+        const result =
+            await response.json()
+
+        if (
+            !result.status ||
+            !result.data ||
+            result.data.length === 0
+        ) {
+            return reply(
+                `╭━━━〔 ❌ NOT FOUND 〕━━━╮\n` +
+                `┃\n` +
+                `┃ 🔎 Query: ${q}\n` +
+                `┃\n` +
+                `┃ Dailymotion results හම්බුනේ නැහැ.\n` +
+                `┃\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+            )
+        }
+
+        const results =
+            result.data.slice(0, 10)
+
+        // =========================================================
+        // SAVE SEARCH RESULTS
+        // =========================================================
+
+        global.dailymotionSearch =
+            global.dailymotionSearch || {}
+
+        global.dailymotionSearch[m.sender] =
+            results
+
+        global.dailymotionSearch[m.from] =
+            results
+
+        // =========================================================
+        // SEARCH RESULT MESSAGE
+        // =========================================================
+
+        let text =
+            `╭━━━〔 🎬 DAILYMOTION SEARCH 〕━━━╮\n` +
+            `┃\n` +
+            `┃ 🔎 Query: ${q}\n` +
+            `┃ 📊 Results: ${result.total}\n` +
+            `┃\n`
+
+        results.forEach((item, index) => {
+
+            text +=
+                `┃ *${index + 1}.* ${item.title}\n` +
+                `┃ 🎞️ ${item.quality}\n` +
+                `┃ ⏱️ ${item.duration}\n` +
+                `┃ 👤 ${item.owner}\n` +
+                `┃\n`
+
+        })
+
+        text +=
+            `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\n` +
+            `📌 *Select Video*\n` +
+            `➜ *.dm 1*\n` +
+            `➜ *.dm 2*\n` +
+            `➜ *.dm 3*\n\n` +
+            `⚡ *CHAMINDU OFC*`
+
+        return reply(text)
+
+    } catch (error) {
+
+        console.error(
+            'Dailymotion Command Error:',
+            error
+        )
+
+        return reply(
+            `╭━━━〔 ❌ DAILYMOTION ERROR 〕━━━╮\n` +
+            `┃\n` +
+            `┃ ${error.message}\n` +
+            `┃\n` +
+            `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+        )
     }
-    break;
+}
+break
+
 }
 case 'papers':
 case 'paper':
