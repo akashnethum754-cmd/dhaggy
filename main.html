@@ -2689,15 +2689,15 @@ body:after{
                 <div class="phone-input-box">
 
                     <span>
-                        +94
+                        +
                     </span>
 
 
                     <input
                         type="tel"
                         id="phoneInput"
-                        placeholder="768069800"
-                        maxlength="10">
+                        placeholder="94768069800"
+                        maxlength="15">
 
 
                     <button
@@ -3834,7 +3834,7 @@ async function getPairCode(){
     ){
 
         showToast(
-            "Please enter a valid phone number."
+            "Please enter a valid phone number with country code."
         );
 
         phoneInput.focus();
@@ -3844,7 +3844,7 @@ async function getPairCode(){
 
 
     const fullNumber =
-        `94${phone}`;
+        phone;
 
 
     const pairBtn =
