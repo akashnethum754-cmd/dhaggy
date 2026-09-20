@@ -239,8 +239,8 @@ const config = {
     AUTO_TYPING: 'false',
     AUTO_REACT: 'false',
     READ_CMD: 'false',
-    API_MAIN_URL: 'https://zara.laksidu.site',
-    API_MAIN_URL2:'https://zara.laksidu.site',
+    API_MAIN_URL: 'https://zara.laksidu.site/',
+    API_MAIN_URL2:'https://zara.laksidu.site/',
     API_CINESUBZ_URL:'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_MOVIE_URL: 'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_KEY:'lakiya_2f3b6c382d1236ad7a08d56331fb679935d51dfc846df2c254093fd1fff9494e',
@@ -1324,11 +1324,395 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
                 `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
             )
-      }, { quoted: msg });
+        }, { quoted: msg });
+    }
+
+    break;
+                            case 'sinhalasub':
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+            caption: formatMessage(
+                '❌ ERROR',
+                '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .sinhalasub spider*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const movieQuery55 = args.join(' ');
+
+    await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+
+    let sinhalasubSelectionListener = null;
+    let sinhalasubDownloadListener = null;
+    let sinhalasubSelectionTimeout = null;
+    let sinhalasubDownloadTimeout = null;
+
+
+    let sinhalasubMasterTimeout = null;
+    const clearAllSinhalasubListeners = () => {
+        console.log('🧹 Clearing all Sinhalasub listeners');
+
+
+        if (sinhalasubSelectionListener) {
+            socket.ev.off('messages.upsert', sinhalasubSelectionListener);
+            sinhalasubSelectionListener = null;
+        }
+        if (sinhalasubSelectionTimeout) {
+            clearTimeout(sinhalasubSelectionTimeout);
+            sinhalasubSelectionTimeout = null;
+        }
+
+
+        if (sinhalasubDownloadListener) {
+            socket.ev.off('messages.upsert', sinhalasubDownloadListener);
+            sinhalasubDownloadListener = null;
+        }
+        if (sinhalasubDownloadTimeout) {
+            clearTimeout(sinhalasubDownloadTimeout);
+            sinhalasubDownloadTimeout = null;
+        }
+
+
+        if (sinhalasubMasterTimeout) {
+            clearTimeout(sinhalasubMasterTimeout);
+            sinhalasubMasterTimeout = null;
+        }
+    };
+
+    try {
+        const searchResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/search?query=${encodeURIComponent(movieQuery55)}&api_key=${config.API_KEY}`);
+        const searchData = searchResponse.data;
+
+        if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
+            await socket.sendMessage(sender, {
+                 image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                caption: formatMessage(
+                    '❌ NO RESULTS',
+                    '*චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const movies = searchData.data.results.slice(0, 115);
+        let listText = `🎀 *𝗦𝗘𝗔𝗥𝗖𝗛 : _${movieQuery55}_*
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤
+╭──────●➤\n`;
+
+        movies.forEach((movie, index) => {
+            listText += `*🧩 ${index + 1} ┃❭❭ ${movie.title}*\n`;
+        });
+
+        listText += `╰──────────●➤\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
+
+        const sentMsg = await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+            caption: listText
+        }, { quoted: msg });
+
+        const messageID = sentMsg.key.id;
+
+
+        sinhalasubMasterTimeout = setTimeout(() => {
+            clearAllSinhalasubListeners();
+            console.log('🧹 Sinhalasub master timeout - All listeners cleared after 3 minutes');
+        }, 180000);
+
+
+        const handleSelection = async ({ messages: replyMessages }) => {
+            const replyMek = replyMessages[0];
+            if (!replyMek?.message) return;
+
+            const messageType = replyMek.message.conversation || replyMek.message.extendedTextMessage?.text;
+            const isReplyToSentMsg = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+
+            if (isReplyToSentMsg && sender === replyMek.key.remoteJid) {
+
+                if (sinhalasubSelectionTimeout) {
+                    clearTimeout(sinhalasubSelectionTimeout);
+                    sinhalasubSelectionTimeout = null;
+                }
+
+
+                sinhalasubSelectionTimeout = setTimeout(() => {
+                    if (sinhalasubSelectionListener) {
+                        socket.ev.off('messages.upsert', sinhalasubSelectionListener);
+                        sinhalasubSelectionListener = null;
+                        console.log('🧹 Sinhalasub selection listener timeout');
+                    }
+                    sinhalasubSelectionTimeout = null;
+                }, 120000);
+
+                const choice = parseInt(messageType) - 1;
+                if (isNaN(choice) || choice < 0 || choice >= movies.length) {
+                    await socket.sendMessage(sender, {
+                         image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                        caption: formatMessage(
+                            '❌ INVALID SELECTION',
+                            `*වැරදි අංකයක්! 1-${movies.length} අතර තෝරන්න! 😕*`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        )
+                    }, { quoted: replyMek });
+                    return;
+                }
+
+                const selectedMovie = movies[choice];
+
+                await socket.sendMessage(sender, { 
+                    text: '📽️ 𝙁𝙚𝙩𝙘𝙝𝙞𝙣𝙜 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...' 
+                }, { quoted: replyMek });
+
+
+                await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                try {
+                    const infoResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/info?url=${encodeURIComponent(selectedMovie.url)}&api_key=${config.API_KEY}`);
+                    const infoData = infoResponse.data;
+
+                    if (!infoData.status || !infoData.data) {
+                        throw new Error('Failed to fetch movie details');
+                    }
+
+                    const movieInfo = infoData.data.movie;
+                    const downloads = infoData.data.downloads || [];
+
+
+                    const videoDownloads = downloads.filter(d => d.server === 'pixeldrain');
+
+                    if (videoDownloads.length === 0) {
+                        await socket.sendMessage(sender, {
+                             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                            caption: formatMessage(
+                                '❌ NO DOWNLOADS',
+                                '*Pixeldrain බාගත කිරීම් නොමැත!*',
+                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                            )
+                        }, { quoted: replyMek });
+                        return;
+                    }
+
+                    const castPreview = movieInfo.cast?.slice(0, 5).join(', ') + (movieInfo.cast?.length > 5 ? '...' : '');
+
+                    const detailsCaption = formatMessage(
+                        `🍀 *𝗧ɪᴛʟᴇ : ${movieInfo.title}`,
+                        `▫️📅 *𝗥ᴇʟᴇᴀꜱᴇ 𝗬ᴇᴀʀ ➟ ${movieInfo.year || 'N/A'}*
+▫️🥇 *𝗜𝗺𝗱ʙ 𝗥ᴀᴛɪɴɢ ➟ ${movieInfo.rating || 'N/A'}/10*
+▫️📊 *𝗤ᴜᴀʟɪᴛʏ ➟ ${movieInfo.quality || 'N/A'}*
+▫️⏳ *𝗗ᴜʀᴀᴛɪᴏɴ ➟ ${movieInfo.runtime || 'N/A'}*
+▫️🔠 *𝗟ᴀɴɢᴜᴀɢᴇ ➟ ${movieInfo.language || 'N/A'}*
+▫️🎭 *𝗚ᴇɴʀᴇꜱ ➟ ${movieInfo.genres?.join(', ') || 'N/A'}*
+▫️🙅 *𝗗ɪʀᴇᴄᴛᴏʀ ➟ ${movieInfo.director?.slice(0,2).join(', ') || 'N/A'}*
+▫️👥 *𝗖ᴀꜱᴛ ➟ ${castPreview || 'N/A'}*
+▫️👨‍💻 *𝗦ᴜʙᴛɪᴛʟᴇ ➟ ${movieInfo.subtitle?.author || 'Sinhala'} (${movieInfo.subtitle?.site || 'Baiscope'})*
+▫️📖 *sᴛᴏʀʏ ➟ ${movieInfo.description?.substring(0, 150) || 'No description'}...*
+▫️🔗 *Jᴏɪɴ ➟ ${sessionConfig.MGROUP_LINK || config.MGROUP_LINK}*`,
+                        `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                    );
+
+                    const infoMsg = await socket.sendMessage(sender, {
+                        image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        caption: detailsCaption
+                    }, { quoted: replyMek });
+
+
+                    await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                    const downloadOptionsText = `*⬇️🎀 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗢𝗣𝗧𝗜𝗢𝗡𝗦*
+*Reply with number 👇*
+
+${videoDownloads.map((d, i) => 
+`*🔰 ${i + 1} ┃ 📥 ${d.quality || 'N/A'} • ${d.size || 'N/A'}*`
+).join('\n')}
+
+${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+                    const downloadMsg = await socket.sendMessage(sender, {
+                        text: downloadOptionsText
+                    }, { quoted: infoMsg });
+
+                    const infoMsgID = downloadMsg.key.id;
+
+
+                    const handleDownload = async ({ messages: downloadMessages }) => {
+                        const downloadMek = downloadMessages[0];
+                        if (!downloadMek?.message) return;
+
+                        const downloadChoice = downloadMek.message.conversation || downloadMek.message.extendedTextMessage?.text;
+                        const isReplyToInfoMsg = downloadMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
+
+                        if (isReplyToInfoMsg && sender === downloadMek.key.remoteJid) {
+
+                            if (sinhalasubDownloadTimeout) {
+                                clearTimeout(sinhalasubDownloadTimeout);
+                                sinhalasubDownloadTimeout = null;
+                            }
+
+
+                            sinhalasubDownloadTimeout = setTimeout(() => {
+                                if (sinhalasubDownloadListener) {
+                                    socket.ev.off('messages.upsert', sinhalasubDownloadListener);
+                                    sinhalasubDownloadListener = null;
+                                    console.log('🧹 Sinhalasub download listener timeout');
+                                }
+                                sinhalasubDownloadTimeout = null;
+                            }, 120000);
+
+                            const choiceNum = parseInt(downloadChoice) - 1;
+
+                            if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= videoDownloads.length) {
+                                await socket.sendMessage(sender, {
+                                     image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                                    caption: formatMessage(
+                                        '❌ INVALID SELECTION',
+                                        `*වැරදි අංකයක්! 1-${videoDownloads.length} අතර තෝරන්න!*`,
+                                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                    )
+                                }, { quoted: downloadMek });
+                                return;
+                            }
+
+                            const selectedDownload = videoDownloads[choiceNum];
+
+                            await socket.sendMessage(sender, { 
+                                text: `⏳ 𝙂𝙚𝙩𝙩𝙞𝙣𝙜 𝙙𝙤𝙬𝙣𝙡𝙤𝙖𝙙 𝙡𝙞𝙣𝙠...` 
+                            }, { quoted: downloadMek });
+
+
+                            await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                            try {
+
+                                const downloadResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/download2?url=${encodeURIComponent(selectedDownload.link_page)}&api_key=${config.API_KEY}`);
+                                const downloadData = downloadResponse.data;
+
+                                if (!downloadData.status || !downloadData.data?.download) {
+                                    throw new Error('Failed to get download URL');
+                                }
+
+                                const finalDownloadUrl = downloadData.data.download;
+                                const fileInfo = downloadData.data.file_info || {};
+
+
+                                let fileName = fileInfo.name || `${movieInfo.title} [${selectedDownload.quality || 'Unknown'}].mp4`;
+                                const mimeType = fileInfo.mimeType || 'video/mp4';
+
+                                console.log('Download URL:', finalDownloadUrl);
+                                console.log('File Name:', fileName);
+                                console.log('Mime Type:', mimeType);
+
+                                await socket.sendMessage(sender, { react: { text: '📥', key: downloadMek.key } });
+
+
+
+
+                                let sizeText = 'N/A';
+                                if (fileInfo.size) {
+                                    const sizeInMB = fileInfo.size / 1024 / 1024;
+                                    if (sizeInMB > 1024) {
+                                        sizeText = (sizeInMB / 1024).toFixed(2) + ' GB';
+                                    } else {
+                                        sizeText = sizeInMB.toFixed(2) + ' MB';
+                                    }
+                                }
+
+
+                                await socket.sendMessage(sender, {
+                                    document: { url: finalDownloadUrl },
+                                    mimetype: mimeType,
+                                    fileName: fileName,
+                                    caption: formatMessage(
+                                        `🍀 ${movieInfo.title}`,
+                                        `\`❚█${sessionConfig.MOVIE_CAPTION || config.MOVIE_CAPTION}█❚\`
+
+\`❪${selectedDownload.quality || 'Unknown'}❫\``,
+                                        `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                                    )
+                                }, { quoted: downloadMek });
+
+                                await socket.sendMessage(sender, { react: { text: '✅', key: downloadMek.key } });
+
+
+                                clearAllSinhalasubListeners();
+
+                            } catch (downloadError) {
+                                console.error('Download link error:', downloadError);
+                                await socket.sendMessage(sender, {
+                                     image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                                    caption: formatMessage(
+                                        '❌ DOWNLOAD ERROR',
+                                        `*Download link එක ලබාගැනීමේ දෝෂයක්.*\nError: ${downloadError.message}`,
+                                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                    )
+                                }, { quoted: downloadMek });
+                            }
+                        }
+                    };
+
+
+                    sinhalasubDownloadListener = handleDownload;
+                    socket.ev.on('messages.upsert', handleDownload);
+
+
+                    sinhalasubDownloadTimeout = setTimeout(() => {
+                        if (sinhalasubDownloadListener) {
+                            socket.ev.off('messages.upsert', sinhalasubDownloadListener);
+                            sinhalasubDownloadListener = null;
+                            console.log('🧹 Sinhalasub download listener timeout - cleaned up');
+                        }
+                        sinhalasubDownloadTimeout = null;
+                    }, 120000);
+
+                } catch (infoError) {
+                    console.error('Movie info error:', infoError);
+                    await socket.sendMessage(sender, {
+                         image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                        caption: formatMessage(
+                            '❌ ERROR',
+                            `*Movie details ලබාගැනීමේ දෝෂයක්:* ${infoError.message}`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        )
+                    }, { quoted: replyMek });
+                }
+            }
+        };
+
+
+        sinhalasubSelectionListener = handleSelection;
+        socket.ev.on('messages.upsert', handleSelection);
+
+
+        sinhalasubSelectionTimeout = setTimeout(() => {
+            if (sinhalasubSelectionListener) {
+                socket.ev.off('messages.upsert', sinhalasubSelectionListener);
+                sinhalasubSelectionListener = null;
+                console.log('🧹 Sinhalasub selection listener timeout - cleaned up');
+            }
+            sinhalasubSelectionTimeout = null;
+        }, 120000);
+
+    } catch (error) {
+        console.error('Movie command error:', error);
+
+        clearAllSinhalasubListeners();
+        await socket.sendMessage(sender, {
+             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+            caption: formatMessage(
+                '❌ ERROR',
+                `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
     }
     break;
 
-    break  case 'menu':
+    break;    case 'menu':
 case 'help': {
     try {
         const pushName = msg.pushName || 'User';
@@ -1380,7 +1764,7 @@ case 'help': {
                 body:
 `╭─「 🔍 ꜱᴇᴀʀᴄʜ ᴄᴍᴅꜱ 」*
   • .cinesubz    — Movie search
-  • .sinhalasub  — Movie search
+  • .sihalasub  — Movie search
   • .cinetv      — TV Series
   • .movie       — Multi source
   • .thinkiri    — TheNkiri
