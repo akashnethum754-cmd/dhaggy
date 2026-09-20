@@ -239,8 +239,8 @@ const config = {
     AUTO_TYPING: 'false',
     AUTO_REACT: 'false',
     READ_CMD: 'false',
-    API_MAIN_URL: 'https://api-siteh-22e22e4cb068.herokuapp.com',
-    API_MAIN_URL2:'https://api.laksidu.site',
+    API_MAIN_URL: 'https://zara.laksidu.site/',
+    API_MAIN_URL2:'https://zara.laksidu.site/',
     API_CINESUBZ_URL:'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_MOVIE_URL: 'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_KEY:'lakiya_2f3b6c382d1236ad7a08d56331fb679935d51dfc846df2c254093fd1fff9494e',
@@ -4132,6 +4132,383 @@ ${fileUrl}
         clearAllPlkListeners();
         await socket.sendMessage(sender, {
             text: `*❪ 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗘𝗥𝗥𝗢𝗥 ❫*\n\n❌ *Search Error:* ${err.message}${DEFAULT_FOOTER}`
+        }, { quoted: msg });
+    }
+    break;
+}
+case 'singrup':
+    if (!args.length || !args.join(' ').includes(',')) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                '*කරුණාකර group link සහ චිත්‍රපටයේ නම ලබාදෙන්න!*\n*උදා: .singrup https://chat.whatsapp.com/xxxxx,spider*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    // Parse gruplink and moviename
+    const singrupArgs = args.join(' ');
+    const commaIndex = singrupArgs.indexOf(',');
+    const groupLinkInput = singrupArgs.substring(0, commaIndex).trim();
+    const movieQuery = singrupArgs.substring(commaIndex + 1).trim();
+
+    if (!groupLinkInput || !movieQuery) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                '*Group link සහ movie name දෙකම ලබාදෙන්න!*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    // Extract group invite code
+    let groupInviteCode = groupLinkInput;
+    if (groupLinkInput.includes('chat.whatsapp.com/')) {
+        groupInviteCode = groupLinkInput.split('chat.whatsapp.com/')[1].split('?')[0].trim();
+    }
+
+    // Get target group JID
+    let targetGroupJid = null;
+    try {
+        const groupInfo = await socket.groupGetInviteInfo(groupInviteCode);
+        targetGroupJid = groupInfo.id;
+        console.log('✅ Target group JID:', targetGroupJid);
+    } catch (groupErr) {
+        console.error('Group link error:', groupErr);
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ GROUP ERROR',
+                `*Group link එක වැරදියි හෝ bot ට access නැහැ!*\nError: ${groupErr.message}`,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+    let singrupSelectionListener = null;
+    let singrupDownloadListener = null;
+    let singrupSelectionTimeout = null;
+    let singrupDownloadTimeout = null;
+    let singrupMasterTimeout = null;
+
+    const clearAllSingrupListeners = () => {
+        console.log('🧹 Clearing all Singrup listeners');
+        if (singrupSelectionListener) {
+            socket.ev.off('messages.upsert', singrupSelectionListener);
+            singrupSelectionListener = null;
+        }
+        if (singrupSelectionTimeout) {
+            clearTimeout(singrupSelectionTimeout);
+            singrupSelectionTimeout = null;
+        }
+        if (singrupDownloadListener) {
+            socket.ev.off('messages.upsert', singrupDownloadListener);
+            singrupDownloadListener = null;
+        }
+        if (singrupDownloadTimeout) {
+            clearTimeout(singrupDownloadTimeout);
+            singrupDownloadTimeout = null;
+        }
+        if (singrupMasterTimeout) {
+            clearTimeout(singrupMasterTimeout);
+            singrupMasterTimeout = null;
+        }
+    };
+
+    try {
+        const searchResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/search?query=${encodeURIComponent(movieQuery)}&api_key=${config.API_KEY}`);
+        const searchData = searchResponse.data;
+
+        if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
+            await socket.sendMessage(sender, {
+                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: formatMessage(
+                    '❌ NO RESULTS',
+                    '*චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const movies = searchData.data.results.slice(0, 115);
+        let listText = `🎀 *𝗦𝗘𝗔𝗥𝗖𝗛 : _${movieQuery}_*
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤
+╭──────●➤\n`;
+
+        movies.forEach((movie, index) => {
+            listText += `*🧩 ${index + 1} ┃❭❭ ${movie.title}*\n`;
+        });
+
+        listText += `╰──────────●➤\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
+
+        const sentMsg = await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: listText
+        }, { quoted: msg });
+
+        const messageID = sentMsg.key.id;
+
+        singrupMasterTimeout = setTimeout(() => {
+            clearAllSingrupListeners();
+            console.log('🧹 Singrup master timeout');
+        }, 180000);
+
+        const handleSelection = async ({ messages: replyMessages }) => {
+            const replyMek = replyMessages[0];
+            if (!replyMek?.message) return;
+
+            const messageType = replyMek.message.conversation || replyMek.message.extendedTextMessage?.text;
+            const isReplyToSentMsg = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+
+            if (isReplyToSentMsg && sender === replyMek.key.remoteJid) {
+                if (singrupSelectionTimeout) {
+                    clearTimeout(singrupSelectionTimeout);
+                    singrupSelectionTimeout = null;
+                }
+
+                const choice = parseInt(messageType) - 1;
+                if (isNaN(choice) || choice < 0 || choice >= movies.length) {
+                    await socket.sendMessage(sender, {
+                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        caption: formatMessage(
+                            '❌ INVALID SELECTION',
+                            `*වැරදි අංකයක්! 1-${movies.length} අතර තෝරන්න! 😕*`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        )
+                    }, { quoted: replyMek });
+                    return;
+                }
+
+                const selectedMovie = movies[choice];
+
+                await socket.sendMessage(sender, {
+                    text: '📽️ 𝙁𝙚𝙩𝙘𝙝𝙞𝙣𝙜 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...'
+                }, { quoted: replyMek });
+
+                await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                try {
+                    const infoResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/info?url=${encodeURIComponent(selectedMovie.url)}&api_key=${config.API_KEY}`);
+                    const infoData = infoResponse.data;
+
+                    if (!infoData.status || !infoData.data) {
+                        throw new Error('Failed to fetch movie details');
+                    }
+
+                    const movieInfo = infoData.data.movie;
+                    const downloads = infoData.data.downloads || [];
+                    const videoDownloads = downloads.filter(d => d.server === 'pixeldrain');
+
+                    if (videoDownloads.length === 0) {
+                        await socket.sendMessage(sender, {
+                            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            caption: formatMessage(
+                                '❌ NO DOWNLOADS',
+                                '*Pixeldrain බාගත කිරීම් නොමැත!*',
+                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                            )
+                        }, { quoted: replyMek });
+                        return;
+                    }
+
+                    const castPreview = movieInfo.cast?.slice(0, 5).join(', ') + (movieInfo.cast?.length > 5 ? '...' : '');
+
+                    const detailsCaption = formatMessage(
+                        `🍀 *𝗧ɪᴛʟᴇ : ${movieInfo.title}`,
+                        `▫️📅 *𝗥ᴇʟᴇᴀꜱᴇ 𝗬ᴇᴀʀ ➟ ${movieInfo.year || 'N/A'}*
+▫️🥇 *𝗜𝗺𝗱ʙ 𝗥ᴀᴛɪɴɢ ➟ ${movieInfo.rating || 'N/A'}/10*
+▫️📊 *𝗤ᴜᴀʟɪᴛʏ ➟ ${movieInfo.quality || 'N/A'}*
+▫️⏳ *𝗗ᴜʀᴀᴛɪᴏɴ ➟ ${movieInfo.runtime || 'N/A'}*
+▫️🔠 *𝗟ᴀɴɢᴜᴀɢᴇ ➟ ${movieInfo.language || 'N/A'}*
+▫️🎭 *𝗚ᴇɴʀᴇꜱ ➟ ${movieInfo.genres?.join(', ') || 'N/A'}*
+▫️🙅 *𝗗ɪʀᴇᴄᴛᴏʀ ➟ ${movieInfo.director?.slice(0,2).join(', ') || 'N/A'}*
+▫️👥 *𝗖ᴀꜱᴛ ➟ ${castPreview || 'N/A'}*
+▫️👨‍💻 *𝗦ᴜʙᴛɪᴛʟᴇ ➟ ${movieInfo.subtitle?.author || 'Sinhala'} (${movieInfo.subtitle?.site || 'Baiscope'})*
+▫️📖 *sᴛᴏʀʏ ➟ ${movieInfo.description?.substring(0, 150) || 'No description'}...*
+▫️🔗 *Jᴏɪɴ ➟ ${sessionConfig.MGROUP_LINK || config.MGROUP_LINK}*`,
+                        `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                    );
+
+                    const infoMsg = await socket.sendMessage(sender, {
+                        image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        caption: detailsCaption
+                    }, { quoted: replyMek });
+
+                    await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                    const downloadOptionsText = `*⬇️🎀 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗢𝗣𝗧𝗜𝗢𝗡𝗦*
+*Reply with number 👇*
+
+${videoDownloads.map((d, i) => 
+`*🔰 ${i + 1} ┃ 📥 ${d.quality || 'N/A'} • ${d.size || 'N/A'}*`
+).join('\n')}
+
+${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+                    const downloadMsg = await socket.sendMessage(sender, {
+                        text: downloadOptionsText
+                    }, { quoted: infoMsg });
+
+                    const infoMsgID = downloadMsg.key.id;
+
+                    const handleDownload = async ({ messages: downloadMessages }) => {
+                        const downloadMek = downloadMessages[0];
+                        if (!downloadMek?.message) return;
+
+                        const downloadChoice = downloadMek.message.conversation || downloadMek.message.extendedTextMessage?.text;
+                        const isReplyToInfoMsg = downloadMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
+
+                        if (isReplyToInfoMsg && sender === downloadMek.key.remoteJid) {
+                            if (singrupDownloadTimeout) {
+                                clearTimeout(singrupDownloadTimeout);
+                                singrupDownloadTimeout = null;
+                            }
+
+                            const choiceNum = parseInt(downloadChoice) - 1;
+
+                            if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= videoDownloads.length) {
+                                await socket.sendMessage(sender, {
+                                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    caption: formatMessage(
+                                        '❌ INVALID SELECTION',
+                                        `*වැරදි අංකයක්! 1-${videoDownloads.length} අතර තෝරන්න!*`,
+                                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                    )
+                                }, { quoted: downloadMek });
+                                return;
+                            }
+
+                            const selectedDownload = videoDownloads[choiceNum];
+
+                            await socket.sendMessage(sender, {
+                                text: `⏳ 𝙂𝙚𝙩𝙩𝙞𝙣𝙜 𝙙𝙤𝙬𝙣𝙡𝙤𝙖𝙙 𝙡𝙞𝙣𝙠...`
+                            }, { quoted: downloadMek });
+
+                            await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 2000) + 2000));
+
+                            try {
+                                const downloadResponse = await axios.get(`${config.API_MAIN_URL}/sinhalasub/download2?url=${encodeURIComponent(selectedDownload.link_page)}&api_key=${config.API_KEY}`);
+                                const downloadData = downloadResponse.data;
+
+                                if (!downloadData.status || !downloadData.data?.download) {
+                                    throw new Error('Failed to get download URL');
+                                }
+
+                                const finalDownloadUrl = downloadData.data.download;
+                                const fileInfo = downloadData.data.file_info || {};
+
+                                let fileName = fileInfo.name || `${movieInfo.title} [${selectedDownload.quality || 'Unknown'}].mp4`;
+                                const mimeType = fileInfo.mimeType || 'video/mp4';
+
+                                await socket.sendMessage(sender, { react: { text: '📥', key: downloadMek.key } });
+
+                                // ============ SEND TO TARGET GROUP ============
+                                const groupCaption = formatMessage(
+                                    `🍀 ${movieInfo.title}`,
+                                    `\`❚█${sessionConfig.MOVIE_CAPTION || config.MOVIE_CAPTION}█❚\`
+
+\`❪${selectedDownload.quality || 'Unknown'}❫\``,
+                                    `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                                );
+
+                                // 1. Send movie post (image + details) to group
+                                await socket.sendMessage(targetGroupJid, {
+                                    image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    caption: detailsCaption
+                                });
+
+                                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                                // 2. Send MP4 document to group
+                                await socket.sendMessage(targetGroupJid, {
+                                    document: { url: finalDownloadUrl },
+                                    mimetype: mimeType,
+                                    fileName: fileName,
+                                    caption: groupCaption
+                                });
+
+                                // 3. Confirm to user
+                                await socket.sendMessage(sender, { react: { text: '✅', key: downloadMek.key } });
+                                await socket.sendMessage(sender, {
+                                    text: `✅ *සාර්ථකව group එකට යවන ලදී!*\n\n📽️ *${movieInfo.title}*\n📊 *${selectedDownload.quality || 'Unknown'}*\n👥 *Group:* ${groupInfo.subject || 'Target Group'}`
+                                }, { quoted: downloadMek });
+
+                                clearAllSingrupListeners();
+
+                            } catch (downloadError) {
+                                console.error('Download link error:', downloadError);
+                                await socket.sendMessage(sender, {
+                                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    caption: formatMessage(
+                                        '❌ DOWNLOAD ERROR',
+                                        `*Download link එක ලබාගැනීමේ දෝෂයක්.*\nError: ${downloadError.message}`,
+                                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                    )
+                                }, { quoted: downloadMek });
+                            }
+                        }
+                    };
+
+                    singrupDownloadListener = handleDownload;
+                    socket.ev.on('messages.upsert', handleDownload);
+
+                    singrupDownloadTimeout = setTimeout(() => {
+                        if (singrupDownloadListener) {
+                            socket.ev.off('messages.upsert', singrupDownloadListener);
+                            singrupDownloadListener = null;
+                            console.log('🧹 Singrup download listener timeout');
+                        }
+                        singrupDownloadTimeout = null;
+                    }, 120000);
+
+                } catch (infoError) {
+                    console.error('Movie info error:', infoError);
+                    await socket.sendMessage(sender, {
+                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        caption: formatMessage(
+                            '❌ ERROR',
+                            `*Movie details ලබාගැනීමේ දෝෂයක්:* ${infoError.message}`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        )
+                    }, { quoted: replyMek });
+                }
+            }
+        };
+
+        singrupSelectionListener = handleSelection;
+        socket.ev.on('messages.upsert', handleSelection);
+
+        singrupSelectionTimeout = setTimeout(() => {
+            if (singrupSelectionListener) {
+                socket.ev.off('messages.upsert', singrupSelectionListener);
+                singrupSelectionListener = null;
+                console.log('🧹 Singrup selection listener timeout');
+            }
+            singrupSelectionTimeout = null;
+        }, 120000);
+
+    } catch (error) {
+        console.error('Movie command error:', error);
+        clearAllSingrupListeners();
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
         }, { quoted: msg });
     }
     break;
@@ -8771,7 +9148,7 @@ case '❤️': {
     }
     break;
 }
-case 'cinesubz':             
+case 'cinbz':             
 case 'cinetv': {
     const DEFAULT_FOOTER = `\n\n> 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗠𝗢𝗩𝗜𝗘 𝗕𝗢𝗧 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ ʟYɴᴋᴏ`;
 
