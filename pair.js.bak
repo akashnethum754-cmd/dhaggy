@@ -1326,9 +1326,9 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
             )
         }, { quoted: msg });
     }
-
     break;
-         }       
+         
+            }
    case 'menu':
 case 'help': {
     try {
