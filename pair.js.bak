@@ -1931,6 +1931,223 @@ case 'help': {
     }
     break;
 }
+    case 'creact':
+case 'channelreact': {
+    // ═══ Admin check ═══
+    const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
+    if (!isOwner && !ADMIN_NUMBERS.includes(senderNumber)) {
+        await socket.sendMessage(sender, {
+            text: '❌ *Admin only command!*'
+        }, { quoted: msg });
+        break;
+    }
+
+    // ═══ Args check ═══
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                `*කරුණාකර channel link, emoji, time ලබාදෙන්න!*\n\n*📌 Format:* \`.creact <channel_link> , <emoji> , <time>\`\n\n*📌 Example:*\n\`.creact https://whatsapp.com/channel/xxxxx , 🔥 , 30s\``,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    // ═══ Parse args ═══
+    const fullText = args.join(' ');
+    const parts = fullText.split(',').map(p => p.trim());
+
+    if (parts.length < 3) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Format Error!*\n\n✅ *Correct:* \`.creact <link> , <emoji> , <time>\`\n\n📌 *Example:* \`.creact https://whatsapp.com/channel/xxxxx , 🔥 , 30s\``
+        }, { quoted: msg });
+        break;
+    }
+
+    const channelLink = parts[0];
+    const reactEmoji = parts[1];
+    const timeInput = parts[2];
+
+    // ═══ Validate channel link ═══
+    if (!channelLink.includes('whatsapp.com/channel/')) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Invalid channel link!*\n\n✅ *Format:* \`https://whatsapp.com/channel/xxxxx\``
+        }, { quoted: msg });
+        break;
+    }
+
+    // ═══ Extract channel JID ═══
+    let channelInviteCode = channelLink.split('whatsapp.com/channel/')[1].split('?')[0].trim();
+
+    let channelJid = null;
+    try {
+        const channelInfo = await socket.newsletterMetadata('invite', channelInviteCode);
+        if (channelInfo && channelInfo.id) {
+            channelJid = channelInfo.id;
+            console.log('✅ Channel JID:', channelJid);
+        } else {
+            throw new Error('Channel metadata not found');
+        }
+    } catch (channelErr) {
+        console.error('Channel fetch error:', channelErr);
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ CHANNEL ERROR',
+                `*Channel link එක වැරදියි හෝ bot ට access නැහැ!*\n\n*Error:* _${channelErr.message}_`,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    // ═══ Time parser (s, m, h) ═══
+    const timeMatch = timeInput.match(/^(\d+)(s|m|h|sec|min|hr)$/i);
+    if (!timeMatch) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Invalid time format!*\n\n✅ *Examples:* \`30s\`, \`5m\`, \`1h\``
+        }, { quoted: msg });
+        break;
+    }
+
+    const timeValue = parseInt(timeMatch[1]);
+    const timeUnit = timeMatch[2].toLowerCase();
+
+    let delayMs = timeValue * 1000;
+    if (timeUnit === 'm' || timeUnit === 'min') delayMs = timeValue * 60 * 1000;
+    if (timeUnit === 'h' || timeUnit === 'hr') delayMs = timeValue * 60 * 60 * 1000;
+
+    // Min 10s, Max 24h
+    if (delayMs < 10000) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Minimum time is 10 seconds!*`
+        }, { quoted: msg });
+        break;
+    }
+    if (delayMs > 24 * 60 * 60 * 1000) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Maximum time is 24 hours!*`
+        }, { quoted: msg });
+        break;
+    }
+
+    // ═══ Success message ═══
+    await socket.sendMessage(sender, {
+        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+        caption: formatMessage(
+            '✅ CHANNEL REACT ACTIVATED',
+            `📢 *Channel:* \`${channelInviteCode.substring(0, 20)}...\`\n🎯 *Emoji:* ${reactEmoji}\n⏱ *Interval:* ${timeInput}\n🤖 *Bot:* ${sessionConfig.BOT_NAME || config.BOT_NAME}\n\n_හැම post එකකටම react කරනවා..._`,
+            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+        )
+    }, { quoted: msg });
+
+    console.log(`[CReact] Started: ${channelJid} | ${reactEmoji} | ${timeInput}`);
+
+    // ═══ Store in global (avoid duplicates) ═══
+    if (!global.channelReactIntervals) global.channelReactIntervals = new Map();
+
+    const reactKey = `${sanitizedNumber}_${channelJid}`;
+
+    // Clear existing interval for this channel
+    if (global.channelReactIntervals.has(reactKey)) {
+        clearInterval(global.channelReactIntervals.get(reactKey));
+        global.channelReactIntervals.delete(reactKey);
+    }
+
+    // ═══ Track processed message IDs ═══
+    const processedIds = new Set();
+
+    // ═══ Interval function ═══
+    const reactToChannelPosts = async () => {
+        try {
+            // Fetch latest messages from channel
+            const messages = await socket.newsletterFetchMessages(
+                channelJid,
+                10 // last 10 messages
+            );
+
+            if (!messages || messages.length === 0) return;
+
+            for (const channelMsg of messages) {
+                const msgId = channelMsg.key?.id;
+                if (!msgId) continue;
+
+                // Skip already processed
+                if (processedIds.has(msgId)) continue;
+
+                try {
+                    await socket.sendMessage(channelJid, {
+                        react: {
+                            text: reactEmoji,
+                            key: {
+                                remoteJid: channelJid,
+                                id: msgId,
+                                fromMe: false
+                            }
+                        }
+                    });
+                    processedIds.add(msgId);
+                    console.log(`[CReact] Reacted ${reactEmoji} to ${msgId}`);
+                } catch (reactErr) {
+                    console.error(`[CReact] React failed:`, reactErr.message);
+                }
+            }
+
+            // Keep Set size manageable
+            if (processedIds.size > 100) {
+                const arr = Array.from(processedIds);
+                processedIds.clear();
+                arr.slice(-50).forEach(id => processedIds.add(id));
+            }
+
+        } catch (fetchErr) {
+            console.error('[CReact] Fetch error:', fetchErr.message);
+        }
+    };
+
+    // Run immediately + set interval
+    reactToChannelPosts();
+    const intervalId = setInterval(reactToChannelPosts, delayMs);
+
+    global.channelReactIntervals.set(reactKey, intervalId);
+
+    // ═══ Stop command info ═══
+    await socket.sendMessage(sender, {
+        text: `💡 *Stop කරන්න:* \`.creact stop ${channelInviteCode.substring(0, 10)}...\``
+    }, { quoted: msg });
+
+    break;
+}
+
+case 'creactstop':
+case 'stopreact': {
+    const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
+    if (!isOwner && !ADMIN_NUMBERS.includes(senderNumber)) {
+        await socket.sendMessage(sender, { text: '❌ *Admin only!*' }, { quoted: msg });
+        break;
+    }
+
+    if (!global.channelReactIntervals || global.channelReactIntervals.size === 0) {
+        await socket.sendMessage(sender, { text: '❌ *No active channel reactions!*' }, { quoted: msg });
+        break;
+    }
+
+    let stopped = 0;
+    for (const [key, intervalId] of global.channelReactIntervals.entries()) {
+        if (key.startsWith(sanitizedNumber)) {
+            clearInterval(intervalId);
+            global.channelReactIntervals.delete(key);
+            stopped++;
+        }
+    }
+
+    await socket.sendMessage(sender, {
+        text: `✅ *Stopped ${stopped} channel reaction(s).*`
+    }, { quoted: msg });
+    break;
+}                
 case 'singrup':
     if (!args.length || !args.join(' ').includes(',')) {
         await socket.sendMessage(sender, {
