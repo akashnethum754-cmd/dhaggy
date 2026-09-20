@@ -2307,7 +2307,6 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
-}
 case 'dm':
 case 'dailymotion': {
     try {
