@@ -2308,7 +2308,6 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
-}
 case 'papers':
 case 'paper':
 case 'pastpapers': {
