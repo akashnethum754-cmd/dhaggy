@@ -1931,6 +1931,435 @@ case 'help': {
     }
     break;
 }
+case 'sula':
+case 'sulatool':
+case 'react': {
+    const axios = require('axios');
+
+    const BOT_IMAGE = sessionConfig.BOT_IMAGE || config.BOT_IMAGE;
+    const BOT_FOOTER = sessionConfig.BOT_FOOTER || config.BOT_FOOTER;
+    const SULA_KEY = 'SK-5JF3YCH6YAJELXQTBR';
+
+    const SULA_BASE = 'https://sulaofc.store/tools/api';
+    const HEADERS = {
+        'Authorization': `Bearer ${SULA_KEY}`,
+        'x-api-key': SK-5JF3YCH6YAJELXQTBR,
+        'Content-Type': 'application/json'
+    };
+
+    const tools = [
+        { id: 1, name: 'AI Image Upscale',  endpoint: '/upscale',  input: 'image_url' },
+        { id: 2, name: 'Background Remove', endpoint: '/removebg', input: 'image_url' },
+        { id: 3, name: 'Image Enhance',     endpoint: '/enhance',  input: 'image_url' },
+        { id: 4, name: 'Image Colorize',    endpoint: '/colorize', input: 'image_url' },
+        { id: 5, name: 'Image Restore',     endpoint: '/restore',  input: 'image_url' },
+        { id: 6, name: 'Video Downloader',  endpoint: '/videodl',  input: 'url' },
+        { id: 7, name: 'Audio Downloader',  endpoint: '/audiodl',  input: 'url' },
+        { id: 8, name: 'Voice Changer',     endpoint: '/voice',    input: 'audio_url' },
+        { id: 9, name: 'Text to Image',     endpoint: '/txt2img',  input: 'text' },
+        { id: 10, name: 'Text to Speech',   endpoint: '/tts',      input: 'text' }
+    ];
+
+    // No args - show list
+    if (!args.length) {
+        let txt = `🛠️ *𝗦𝗨𝗟𝗔 𝗠𝗗 𝗧𝗢𝗢𝗟𝗦*\n╭──────●➤\n`;
+        tools.forEach(t => { txt += `*${t.id}.* ${t.name}\n`; });
+        txt += `╰──────●➤\n*Usage:* .sula <id> <input>\n*Ex:* .sula 1 https://imgur.com/x.jpg\n> ${BOT_FOOTER}`;
+
+        await socket.sendMessage(sender, {
+            image: { url: BOT_IMAGE }, caption: txt
+        }, { quoted: msg });
+        break;
+    }
+
+    // Tool select
+    const toolId = parseInt(args[0]);
+    const toolInput = args.slice(1).join(' ').trim();
+    const tool = tools.find(t => t.id === toolId);
+
+    if (!tool) {
+        await socket.sendMessage(sender, {
+            text: `❌ Tool ID වැරදියි. 1 - ${tools.length} අතර අංකයක් දෙන්න.`
+        }, { quoted: msg });
+        break;
+    }
+
+    if (!toolInput) {
+        await socket.sendMessage(sender, {
+            text: `❌ *${tool.name}* සඳහා input එකක් දෙන්න.\n*Expected:* ${tool.input}`
+        }, { quoted: msg });
+        break;
+    }
+
+    // API Call
+    try {
+        await socket.sendMessage(sender, { react: { text: '⏳', key: msg.key } });
+        await socket.sendMessage(sender, {
+            text: `⏳ *${tool.name}* process වෙමින් පවතී...`
+        }, { quoted: msg });
+
+        const res = await axios.post(`${SULA_BASE}${tool.endpoint}`,
+            { input: toolInput },
+            { headers: HEADERS, timeout: 90000, validateStatus: () => true }
+        );
+
+        const result = res.data;
+
+        if (res.status >= 400 || result?.success === false || result?.error) {
+            throw new Error(result?.message || result?.error || `HTTP ${res.status}`);
+        }
+
+        const outUrl = result?.url || result?.data?.url || result?.result?.url || result?.output;
+        const outText = result?.text || result?.data?.text || result?.result?.text;
+
+        if (outUrl) {
+            const lower = outUrl.toLowerCase();
+            if (/\.(jpg|jpeg|png|webp|gif)$/.test(lower)) {
+                await socket.sendMessage(sender, {
+                    image: { url: outUrl },
+                    caption: `✅ *${tool.name}*\n> ${BOT_FOOTER}`
+                }, { quoted: msg });
+            } else if (/\.(mp4|mkv|webm)$/.test(lower)) {
+                await socket.sendMessage(sender, {
+                    video: { url: outUrl },
+                    caption: `✅ *${tool.name}*\n> ${BOT_FOOTER}`
+                }, { quoted: msg });
+            } else if (/\.(mp3|m4a|ogg|wav)$/.test(lower)) {
+                await socket.sendMessage(sender, {
+                    audio: { url: outUrl }, mimetype: 'audio/mp4', ptt: false
+                }, { quoted: msg });
+            } else {
+                await socket.sendMessage(sender, {
+                    text: `✅ *${tool.name}*\n\n🔗 ${outUrl}\n> ${BOT_FOOTER}`
+                }, { quoted: msg });
+            }
+        } else if (outText) {
+            await socket.sendMessage(sender, {
+                text: `✅ *${tool.name}*\n\n${outText}\n> ${BOT_FOOTER}`
+            }, { quoted: msg });
+        } else {
+            await socket.sendMessage(sender, {
+                text: `✅ *${tool.name}*\n\n\`\`\`${JSON.stringify(result).substring(0, 3000)}\`\`\`\n> ${BOT_FOOTER}`
+            }, { quoted: msg });
+        }
+
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+
+    } catch (err) {
+        await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } });
+        await socket.sendMessage(sender, {
+            text: `❌ *SULA Error:*\n${err.response?.data?.message || err.message}`
+        }, { quoted: msg });
+    }
+    break;
+}
+case 'apk':
+case 'modapk':
+case 'mod': {
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: formatMessage(
+                '❌ ERROR',
+                '*කරුණාකර සොයන App එකේ නම ලබාදෙන්න! උදා: .apk Remini*',
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const apkQuery = args.join(' ').trim();
+    const API_BASE = 'https://api.chamindu.site/api/v1/apk/modder';
+    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
+
+    let apkListener = null;
+    let apkMasterTimeout = null;
+
+    const clearApkListeners = () => {
+        if (apkListener) {
+            socket.ev.off('messages.upsert', apkListener);
+            apkListener = null;
+        }
+        if (apkMasterTimeout) {
+            clearTimeout(apkMasterTimeout);
+            apkMasterTimeout = null;
+        }
+    };
+
+    try {
+        await socket.sendMessage(sender, { text: '🔍 Searching modded apps on Modder.me...' }, { quoted: msg });
+
+        const searchRes = await axios.get(`${API_BASE}/search`, {
+            params: { q: apkQuery, api_key: API_KEY },
+            timeout: 20000
+        });
+
+        const searchData = searchRes.data;
+
+        if (!searchData.status || !searchData.data || searchData.data.length === 0) {
+            await socket.sendMessage(sender, {
+                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: formatMessage(
+                    '❌ NO RESULTS',
+                    `*"${apkQuery}" සඳහා කිසිදු App එකක් හමු නොවීය!*`,
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const apkList = searchData.data.slice(0, 15);
+        let listText = `📱 *𝗠𝗢𝗗𝗗𝗘𝗥.𝗠𝗘 𝗔𝗣𝗞 𝗦𝗘𝗔𝗥𝗖𝗛 : _${apkQuery}_*\n`;
+        listText += `📊 *Total:* ${searchData.total} results\n`;
+        listText += `╭──────●➤\n*🔢 ʀᴇ𝗽ʟʏ ʙᴇʟ𝗼ᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+
+        apkList.forEach((item, index) => {
+            listText += `*${index + 1}.* 🎮 ${item.title}\n`;
+            listText += `    ↳ _${item.slug}_\n`;
+        });
+        listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+        const searchMsg = await socket.sendMessage(sender, {
+            image: { url: apkList[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: listText
+        }, { quoted: msg });
+
+        const searchMsgID = searchMsg.key.id;
+
+        apkMasterTimeout = setTimeout(() => {
+            clearApkListeners();
+        }, 120000);
+
+        const handleApkSelection = async ({ messages }) => {
+            const replyMek = messages?.[0];
+            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
+
+            const text = (replyMek.message.conversation ||
+                replyMek.message.extendedTextMessage?.text || '').trim();
+            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === searchMsgID;
+
+            if (!isReply) return;
+
+            const choice = parseInt(text) - 1;
+            if (isNaN(choice) || choice < 0 || choice >= apkList.length) {
+                await socket.sendMessage(sender, {
+                    text: `❌ කරුණාකර 1 - ${apkList.length} අතර අංකයක් ලබාදෙන්න!`
+                }, { quoted: replyMek });
+                return;
+            }
+
+            clearApkListeners();
+            const chosenApk = apkList[choice];
+
+            await socket.sendMessage(sender, { react: { text: '⏳', key: replyMek.key } });
+            await socket.sendMessage(sender, { text: '⏳ Fetching app details & download links...' }, { quoted: replyMek });
+
+            try {
+                const infoRes = await axios.get(`${API_BASE}/infodl`, {
+                    params: { url: chosenApk.url, api_key: API_KEY },
+                    timeout: 25000
+                });
+
+                const appData = infoRes.data?.data;
+                const downloads = appData?.downloads || [];
+
+                if (!appData || downloads.length === 0) {
+                    throw new Error('බාගත කිරීමේ links හමු නොවීය.');
+                }
+
+                let infoText = `📱 *${appData.title}*\n╭──────●➤\n`;
+                infoText += `*🔢 Version:* ${appData.version || 'N/A'}\n`;
+                infoText += `*📦 Size:* ${appData.size || 'N/A'}\n`;
+                infoText += `*🔓 Mod:* ${appData.mod || 'N/A'}\n`;
+                infoText += `*👨‍💻 Developer:* ${appData.developer || 'N/A'}\n`;
+                infoText += `*📂 Category:* ${appData.category || 'N/A'}\n`;
+                infoText += `╰──────────●➤\n`;
+                if (appData.description) {
+                    infoText += `\n📝 _${appData.description.substring(0, 200)}${appData.description.length > 200 ? '...' : ''}_\n`;
+                }
+                infoText += `\n╭──────●➤\n*🔢 ʀᴇ𝗽ʟʏ ʙᴇʟ𝗼ᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+
+                downloads.forEach((dl, i) => {
+                    infoText += `*${i + 1}.* 📥 ${dl.name}\n`;
+                    if (dl.size) infoText += `    ↳ 📦 ${dl.size}\n`;
+                });
+                infoText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+                const infoMsg = await socket.sendMessage(sender, {
+                    image: { url: appData.image || chosenApk.image },
+                    caption: infoText
+                }, { quoted: replyMek });
+
+                const infoMsgID = infoMsg.key.id;
+
+                // Master timeout reset
+                apkMasterTimeout = setTimeout(() => {
+                    clearApkListeners();
+                }, 120000);
+
+                const handleDownloadSelection = async ({ messages: dlMessages }) => {
+                    const dlMek = dlMessages?.[0];
+                    if (!dlMek?.message || dlMek.key.remoteJid !== sender) return;
+
+                    const dlText = (dlMek.message.conversation ||
+                        dlMek.message.extendedTextMessage?.text || '').trim();
+                    const isDlReply = dlMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
+
+                    if (!isDlReply) return;
+
+                    const dlIdx = parseInt(dlText) - 1;
+                    if (isNaN(dlIdx) || dlIdx < 0 || dlIdx >= downloads.length) {
+                        await socket.sendMessage(sender, {
+                            text: `❌ කරුණාකර 1 - ${downloads.length} අතර අංකයක් ලබාදෙන්න!`
+                        }, { quoted: dlMek });
+                        return;
+                    }
+
+                    clearApkListeners();
+                    const selectedDl = downloads[dlIdx];
+
+                    await socket.sendMessage(sender, { react: { text: '📥', key: dlMek.key } });
+                    await socket.sendMessage(sender, {
+                        text: `⏳ *Downloading APK:*\n${selectedDl.name}\n📦 ${selectedDl.size || 'N/A'}\n\n_කරුණාකර ටික වේලාවක් රැඳී සිටින්න..._`
+                    }, { quoted: dlMek });
+
+                    try {
+                        const fileName = `${appData.title.replace(/[^\w\s.-]/g, '').substring(0, 50)}.apk`;
+
+                        await socket.sendMessage(sender, {
+                            document: { url: selectedDl.link },
+                            mimetype: 'application/vnd.android.package-archive',
+                            fileName: fileName,
+                            caption: `✅ *APK DOWNLOADED*\n\n📱 *App:* ${appData.title}\n🔢 *Version:* ${appData.version}\n🔓 *Mod:* ${appData.mod}\n📦 *Size:* ${selectedDl.size || appData.size}\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        }, { quoted: dlMek });
+
+                        await socket.sendMessage(sender, { react: { text: '✅', key: dlMek.key } });
+                    } catch (uploadErr) {
+                        await socket.sendMessage(sender, {
+                            text: `❌ APK එක යැවීමේදී දෝෂයක්: ${uploadErr.message}\n\n🔗 *Direct Link:*\n${selectedDl.link}\n\n📄 *Download Page:*\n${appData.download_page || 'N/A'}`
+                        }, { quoted: dlMek });
+                    }
+                };
+
+                apkListener = handleDownloadSelection;
+                socket.ev.on('messages.upsert', handleDownloadSelection);
+
+            } catch (infoErr) {
+                clearApkListeners();
+                await socket.sendMessage(sender, {
+                    text: `❌ App Info Error: ${infoErr.message}`
+                }, { quoted: replyMek });
+            }
+        };
+
+        apkListener = handleApkSelection;
+        socket.ev.on('messages.upsert', handleApkSelection);
+
+    } catch (err) {
+        clearApkListeners();
+        await socket.sendMessage(sender, {
+            text: `❌ Error: ${err.message}`
+        }, { quoted: msg });
+    }
+    break;
+}
+case 'pair': {
+    const axios = require('axios');
+
+    const BOT_IMAGE = sessionConfig.BOT_IMAGE || config.BOT_IMAGE;
+    const BOT_FOOTER = sessionConfig.BOT_FOOTER || config.BOT_FOOTER;
+
+    // ═══ මේක ඔයාගේ website එකට match කරන්න ═══
+    const PAIR_BASE = 'https://www.shaggytech.online';
+    const PAIR_ENDPOINT = '/api/pair';        // ← F12 එකෙන් හරි endpoint එක ගන්න
+    const PAIR_BODY_KEY = 'phoneNumber';      // ← 'number', 'phone', 'msisdn' වෙන්න පුළුවන්
+
+    // Number එක ලබාදීලා නැත්නම්
+    if (!args.length) {
+        await socket.sendMessage(sender, {
+            image: { url: BOT_IMAGE },
+            caption: `📱 *PAIR SESSION*\n\n*Usage:* .pair 94771234567\n\n_International format එකෙන් ලබාදෙන්න (රට code එකත් එක්ක)_\n> ${BOT_FOOTER}`
+        }, { quoted: msg });
+        break;
+    }
+
+    // Number එක clean කරනවා
+    let number = args.join('').replace(/[^0-9]/g, '');
+
+    // 0 න් පටන් ගන්නවා නම් 94 දාන්න (Sri Lanka)
+    if (number.startsWith('0')) {
+        number = '94' + number.substring(1);
+    }
+
+    // Basic validation
+    if (number.length < 10 || number.length > 15) {
+        await socket.sendMessage(sender, {
+            text: `❌ Invalid number: *${number}*\n\n_International format එකෙන් දෙන්න_\n_Ex: 94771234567_`
+        }, { quoted: msg });
+        break;
+    }
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '⏳', key: msg.key } });
+        await socket.sendMessage(sender, {
+            text: `⏳ *Pairing:* +${number}\n_කරුණාකර ටික වේලාවක් රැඳී සිටින්න..._`
+        }, { quoted: msg });
+
+        // Pair request
+        const payload = {};
+        payload[PAIR_BODY_KEY] = number;
+
+        const res = await axios.post(`${PAIR_BASE}${PAIR_ENDPOINT}`, payload, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (SULA-MD-Bot)'
+            },
+            timeout: 45000,
+            validateStatus: () => true
+        });
+
+        const result = res.data;
+
+        // Error check
+        if (res.status >= 400 || result?.success === false || result?.error) {
+            throw new Error(result?.message || result?.error || `HTTP ${res.status}`);
+        }
+
+        // Pair code එක extract කරන්න - response format එකට අනුව
+        const pairCode =
+            result?.code ||
+            result?.pairCode ||
+            result?.pairingCode ||
+            result?.data?.code ||
+            result?.data?.pairCode ||
+            result?.data?.pairingCode ||
+            result?.result?.code;
+
+        if (!pairCode) {
+            // Raw JSON එක පෙන්නනවා debug එකට
+            await socket.sendMessage(sender, {
+                text: `⚠️ Pair code එක හමු නොවීය.\n\n*Raw response:*\n\`\`\`${JSON.stringify(result).substring(0, 2000)}\`\`\``
+            }, { quoted: msg });
+            break;
+        }
+
+        // Success
+        await socket.sendMessage(sender, {
+            image: { url: BOT_IMAGE },
+            caption: `✅ *PAIR CODE*\n╭──────●➤\n*📱 Number:* +${number}\n*🔑 Code:* \`${pairCode}\`\n╰──────●➤\n\n*විදිය:*\n1. WhatsApp open කරන්න\n2. Linked Devices → Link a Device\n3. *Link with phone number instead* tap කරන්න\n4. මේ code එක type කරන්න: \`${pairCode}\`\n\n> ${BOT_FOOTER}`
+        }, { quoted: msg });
+
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+
+    } catch (err) {
+        await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } });
+        await socket.sendMessage(sender, {
+            text: `❌ *Pair Error:*\n${err.response?.data?.message || err.message}`
+        }, { quoted: msg });
+    }
+    break;
+}
     case 'creact':
 case 'channelreact': {
     // ═══ Admin check ═══
