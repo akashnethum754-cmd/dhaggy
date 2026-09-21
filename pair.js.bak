@@ -11,7 +11,7 @@ import dotenv from 'dotenv';
 import yts from 'yt-search';
 import { pipeline } from 'stream/promises';
 import splitFileModule from 'split-file';
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 const { splitFile } = splitFileModule;
 dotenv.config();
 
