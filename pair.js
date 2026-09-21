@@ -1943,7 +1943,7 @@ case 'react': {
     const SULA_BASE = 'https://sulaofc.store/tools/api';
     const HEADERS = {
         'Authorization': `Bearer ${SULA_KEY}`,
-        'x-api-key': SK-5JF3YCH6YAJELXQTBR,
+        'x-api-key': 'SK-5JF3YCH6YAJELXQTBR',
         'Content-Type': 'application/json'
     };
 
