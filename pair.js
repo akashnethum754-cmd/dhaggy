@@ -258,6 +258,18 @@ const config = {
     MAX_RETRIES: 3
 };
 const activeSockets = new Map();
+// 🆕 Anti-Delete feature ekata message content cache karagannawa (memory eke witharai, temporary)
+const messageCache = new Map(); // key: `${remoteJid}:${msgId}` -> { text, senderNumber, timestamp }
+const MESSAGE_CACHE_LIMIT = 500;
+
+function cacheMessage(remoteJid, msgId, data) {
+    const key = `${remoteJid}:${msgId}`;
+    messageCache.set(key, { ...data, timestamp: Date.now() });
+    if (messageCache.size > MESSAGE_CACHE_LIMIT) {
+        const oldestKey = messageCache.keys().next().value;
+        messageCache.delete(oldestKey);
+    }
+}
 const socketCreationTime = new Map();
 const SESSION_BASE_PATH = './session';
 const NUMBER_LIST_PATH = './numbers.json';
@@ -429,6 +441,28 @@ async function setupCommandHandlers(socket, number) {
         const msg = messages[0];
         if (!msg.message) return;
 
+        // 🆕 ANTI-DELETE: kawruth message ekak delete kalada balala, thiyenawa nam ownerta yawanawa
+        if (msg.message.protocolMessage && (msg.message.protocolMessage.type === 0 || msg.message.protocolMessage.type === 'REVOKE')) {
+            try {
+                if (sessionConfig.ANTI_DELETE === 'true') {
+                    const revokedJid = msg.key.remoteJid;
+                    const deletedId = msg.message.protocolMessage.key?.id;
+                    const cacheKey = `${revokedJid}:${deletedId}`;
+                    const cached = messageCache.get(cacheKey);
+                    if (cached && cached.text) {
+                        const ownerJid = jidNormalizedUser(socket.user.id);
+                        await socket.sendMessage(ownerJid, {
+                            text: `🗑️ *Deleted Message Recovered*\n\n👤 *From:* ${cached.senderNumber}\n💬 *Chat:* ${revokedJid}\n\n📩 *Message:*\n${cached.text}`
+                        });
+                        messageCache.delete(cacheKey);
+                    }
+                }
+            } catch (adErr) {
+                console.error('AntiDelete error:', adErr.message);
+            }
+            return;
+        }
+
         let text = '';
         if (msg.message.conversation) {
             text = msg.message.conversation.trim();
@@ -445,6 +479,12 @@ async function setupCommandHandlers(socket, number) {
         const sender = from;
         const nowsender = msg.key.fromMe ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) : (msg.key.participant || msg.key.remoteJid);
         const senderNumber = (nowsender || '').split('@')[0];
+
+        // 🆕 message eka cache karanawa - anti-delete walata one wenne methanin
+        try {
+            cacheMessage(from, msg.key.id, { text, senderNumber });
+        } catch (cacheErr) { /* ignore */ }
+
         const developers = `${config.OWNER_NUMBERS}`;
         const botNumber = socket.user.id.split(':')[0];
         const isbot = botNumber.includes(senderNumber);
@@ -2308,6 +2348,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
+
 case 'papers':
 case 'paper':
 case 'pastpapers': {
@@ -11492,6 +11533,27 @@ case 'news':
         break;
     } 
 // ==========================================
+// 🆕 ACCESS KEY COMMAND (.getkey) - web panel eke settings edit karanna one key eka
+// ==========================================
+case 'getkey':
+case 'accesskey': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, {
+            text: "❌ *Only the bot owner can use this command.*"
+        }, { quoted: msg });
+    }
+    try {
+        const accessKey = await ensureAccessKey(sanitizedNumber);
+        await socket.sendMessage(sender, {
+            text: `🔑 *Your Access Key:*\n\n\`${accessKey || 'N/A'}\`\n\n_Bot eke Name/Image/Footer/Movie Footer/Online-Offline/Auto-Like/Auto-Seen/Anti-Delete wage settings web panel eken venas karanna me key eka use karanna. Kawruth ekka share karanna epa._`
+        }, { quoted: msg });
+    } catch (e) {
+        console.error('getkey error:', e.message);
+        await socket.sendMessage(sender, { text: '❌ Access key eka ganna bari una.' }, { quoted: msg });
+    }
+    break;
+}
+// ==========================================
 // SYSTEM CONFIGURATION & MONGODB SETTING COMMAND (.set)
 // ==========================================
 case 'set':
@@ -11514,6 +11576,11 @@ case 'setting': {
             `🐞 \`AUTO_TYPING\` (true/false)\n` +
             `🐞 \`STATUS_VIEW\` (true/false)\n` +
             `🐞 \`AUTO_LIKE\` (true/false)\n` +
+            `🐞 \`ANTI_DELETE\` (true/false)\n` +
+            `🐞 \`MOVIE_FOOTER\`\n` +
+            `🐞 \`BOT_NAME\`\n` +
+            `🐞 \`BOT_IMAGE\`\n` +
+            `🐞 \`BOT_FOOTER\`\n` +
             `🐞 \`PREFIX\`\n` +
             `🐞 \`MODE\` (public/private)\n`;
 
@@ -11531,7 +11598,8 @@ case 'setting': {
     const updates = {};
     const validKeys = [
         'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
-        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE'
+        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
+        'ANTI_DELETE', 'MOVIE_FOOTER', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER'
     ];
 
     const pairs = input.split(',');
@@ -11773,7 +11841,6 @@ function generateAccessKey() {
 }
 
 // 🆕 Number ekakata accessKey ekak thiyenawada balala, nathnam alutin generate karala DB eke save karanawa.
-// Dennama widihata: methanin danne 'config' object ekatama athule 'accessKey' field ekak widihata.
 async function ensureAccessKey(number) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     try {
@@ -11794,7 +11861,7 @@ async function ensureAccessKey(number) {
         console.error(`Failed to ensure access key for ${sanitizedNumber}:`, error);
         return null;
     }
-}
+} 
 function setupAutoRestart(socket, number) {
     const maxReconnectAttempts = 10;
     let reconnectAttempts = 0;
@@ -11910,7 +11977,7 @@ async function EmpirePair(number, res) {
 🟢 *Status:* Online
 🔑 *Access Key:* ${accessKey || 'N/A'}
 
-_Bot eke Name/Image/Footer web panel eken venas karanna me Access Key eka use karanna. Kawruth ekka share karanna epa._`,
+_Bot eke Name/Image/Footer/Movie Footer/Online-Offline/Auto-Like/Auto-Seen/Anti-Delete web panel eken venas karanna me Access Key eka use karanna. Kawruth ekka share karanna epa._`,
                             '🇸‌ʜᴀɢɢY 🇽‌ᴍᴅ'
                         )
                     });
