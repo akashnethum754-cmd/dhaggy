@@ -441,6 +441,25 @@ async function setupCommandHandlers(socket, number) {
         const msg = messages[0];
         if (!msg.message) return;
 
+        // 🆕 STATUS UPDATES: Auto View + Auto Like handle karanawa methanin
+        if (msg.key.remoteJid === 'status@broadcast') {
+            try {
+                if (sessionConfig.STATUS_VIEW === 'true') {
+                    await socket.readMessages([msg.key]);
+                }
+                if (sessionConfig.AUTO_LIKE === 'true') {
+                    const likeEmojis = ['❤️', '🔥', '😍', '👍', '😂', '💕', '🎉', '✨'];
+                    const emoji = likeEmojis[Math.floor(Math.random() * likeEmojis.length)];
+                    await socket.sendMessage('status@broadcast', {
+                        react: { text: emoji, key: msg.key }
+                    }, { statusJidList: [msg.key.participant, jidNormalizedUser(socket.user.id)] });
+                }
+            } catch (statusErr) {
+                console.error('Status auto view/like error:', statusErr.message);
+            }
+            return;
+        }
+
         // 🆕 ANTI-DELETE: kawruth message ekak delete kalada balala, thiyenawa nam ownerta yawanawa
         if (msg.message.protocolMessage && (msg.message.protocolMessage.type === 0 || msg.message.protocolMessage.type === 'REVOKE')) {
             try {
@@ -496,6 +515,15 @@ async function setupCommandHandlers(socket, number) {
         if (!isOwner && sessionConfig.MODE === 'private') return;
         if (!isOwner && isGroup && sessionConfig.MODE === 'inbox') return;
         if (!isOwner && !isGroup && sessionConfig.MODE === 'groups') return;
+
+        // 🆕 AUTO SEEN: hama message ekakma auto widihata seen karanawa (command da nemei kiyala check karanne nathuwa)
+        if (sessionConfig.ALWAYS_MSG_SEEN === 'true' && !msg.key.fromMe) {
+            try {
+                await socket.readMessages([msg.key]);
+            } catch (seenErr) {
+                // ignore
+            }
+        }
 
         if (isCmd && sessionConfig.READ_CMD === 'true') {
             try {
@@ -11533,6 +11561,69 @@ case 'news':
         break;
     } 
 // ==========================================
+// 🆕 PAIR COMMAND (.pair) - chat eken alut number ekak pair karanna
+// ==========================================
+case 'pair': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, {
+            text: "❌ *Only the bot owner can use this command.*"
+        }, { quoted: msg });
+    }
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Usage:* \`.pair <number>\`\n\n*Example:*\n\`.pair 94712345678\`\n\n_Number eka country code ekath ekka danna (94, 91, 1, wage)._`
+        }, { quoted: msg });
+    }
+
+    const targetNumber = args[0].replace(/[^0-9]/g, '');
+    if (!targetNumber || targetNumber.length < 9) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Invalid number!* Country code ekath ekka full number eka danna.\nExample: \`.pair 94712345678\``
+        }, { quoted: msg });
+    }
+
+    await socket.sendMessage(sender, {
+        text: `⏳ *Generating pairing code for* \`${targetNumber}\`*...*`
+    }, { quoted: msg });
+
+    try {
+        let responded = false;
+        const mockRes = {
+            headersSent: false,
+            send: async (data) => {
+                if (responded) return;
+                responded = true;
+                mockRes.headersSent = true;
+                if (data?.code) {
+                    await socket.sendMessage(sender, {
+                        text: `🔑 *Pairing Code for* \`${targetNumber}\`*:*\n\n\`${data.code}\`\n\n📱 *WhatsApp > Linked Devices > Link with phone number* walin methana code eka danna.\n\n⏱️ _Code eka මිනිත්තු කිහිපයකින් expire වෙනවා - ඉක්මනට use කරන්න._`
+                    }, { quoted: msg });
+                } else if (data?.error) {
+                    await socket.sendMessage(sender, { text: `❌ ${data.error}` }, { quoted: msg });
+                }
+            },
+            status: (code) => {
+                return {
+                    send: async (data) => {
+                        if (responded) return;
+                        responded = true;
+                        mockRes.headersSent = true;
+                        await socket.sendMessage(sender, {
+                            text: `❌ *Pairing failed* (status ${code}): ${data?.error || 'Unknown error'}`
+                        }, { quoted: msg });
+                    }
+                };
+            }
+        };
+
+        await EmpirePair(targetNumber, mockRes);
+    } catch (e) {
+        console.error('.pair command error:', e.message);
+        await socket.sendMessage(sender, { text: `❌ Pairing eka fail una: ${e.message}` }, { quoted: msg });
+    }
+    break;
+}
+// ==========================================
 // 🆕 ACCESS KEY COMMAND (.getkey) - web panel eke settings edit karanna one key eka
 // ==========================================
 case 'getkey':
@@ -11581,6 +11672,7 @@ case 'setting': {
             `🐞 \`BOT_NAME\`\n` +
             `🐞 \`BOT_IMAGE\`\n` +
             `🐞 \`BOT_FOOTER\`\n` +
+            `🐞 \`AIR_FOOTER\`\n` +
             `🐞 \`PREFIX\`\n` +
             `🐞 \`MODE\` (public/private)\n`;
 
@@ -11599,7 +11691,7 @@ case 'setting': {
     const validKeys = [
         'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
         'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
-        'ANTI_DELETE', 'MOVIE_FOOTER', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER'
+        'ANTI_DELETE', 'MOVIE_FOOTER', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
     ];
 
     const pairs = input.split(',');
@@ -11943,10 +12035,16 @@ async function EmpirePair(number, res) {
             if (connection === 'open') {
                 try {
                     await delay(3000);
-                    await socket.sendPresenceUpdate('unavailable');
+
+                    const userJid = jidNormalizedUser(socket.user.id);
+                    let sessionConfig = await loadUserConfig(sanitizedNumber);
+                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+
+                    // 🆕 ALWAYS_ONLINE respect karanawa - force unavailable karanne nah dan
+                    const initialPresence = sessionConfig.ALWAYS_ONLINE === 'true' ? 'available' : 'unavailable';
+                    await socket.sendPresenceUpdate(initialPresence);
                     try {
                         const lidStore = socket.signalRepository.lidMapping;
-                        const userJid = jidNormalizedUser(socket.user.id);
 
                         if (isPnUser(userJid)) {
                             const lid = await lidStore.getLIDForPN(userJid);
@@ -11957,12 +12055,11 @@ async function EmpirePair(number, res) {
                     }
 
                     setInterval(() => {
-                        socket.sendPresenceUpdate('unavailable').catch(() => {});
+                        // 🆕 Interval eka run wena hama welavakama .set eken update kalath dan latest config eka gannawa
+                        const liveConfig = activeSockets.get(sanitizedNumber)?.config || sessionConfig;
+                        const presence = liveConfig.ALWAYS_ONLINE === 'true' ? 'available' : 'unavailable';
+                        socket.sendPresenceUpdate(presence).catch(() => {});
                     }, 30000);
-
-                    const userJid = jidNormalizedUser(socket.user.id);
-                    let sessionConfig = await loadUserConfig(sanitizedNumber);
-                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
                     // 🆕 Access key ekak nathnam alutin hadanawa (thiyenawa nam eka ma denawa)
                     const accessKey = await ensureAccessKey(sanitizedNumber);
