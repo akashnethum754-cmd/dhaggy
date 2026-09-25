@@ -258,6 +258,18 @@ const config = {
     MAX_RETRIES: 3
 };
 const activeSockets = new Map();
+// 🆕 Anti-Delete feature ekata message content cache karagannawa (memory eke witharai, temporary)
+const messageCache = new Map(); // key: `${remoteJid}:${msgId}` -> { text, senderNumber, timestamp }
+const MESSAGE_CACHE_LIMIT = 500;
+
+function cacheMessage(remoteJid, msgId, data) {
+    const key = `${remoteJid}:${msgId}`;
+    messageCache.set(key, { ...data, timestamp: Date.now() });
+    if (messageCache.size > MESSAGE_CACHE_LIMIT) {
+        const oldestKey = messageCache.keys().next().value;
+        messageCache.delete(oldestKey);
+    }
+}
 const socketCreationTime = new Map();
 const SESSION_BASE_PATH = './session';
 const NUMBER_LIST_PATH = './numbers.json';
@@ -425,9 +437,76 @@ async function setupCommandHandlers(socket, number) {
     let sessionConfig = await loadUserConfig(sanitizedNumber);
     activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
+    // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath,
+    // hama tathpara 3katama check karala live widihata bot ekatama apply karanawa.
+    // (.set command eken direct widihata already apply wenawa - meka thawa web-panel walata)
+    let lastConfigSnapshot = JSON.stringify(sessionConfig);
+    const configSyncInterval = setInterval(async () => {
+        try {
+            const freshConfig = await loadUserConfig(sanitizedNumber);
+            const freshSnapshot = JSON.stringify(freshConfig);
+            if (freshSnapshot !== lastConfigSnapshot) {
+                sessionConfig = freshConfig;
+                lastConfigSnapshot = freshSnapshot;
+                activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                console.log(`🔄 Config auto-synced for ${sanitizedNumber} (web panel/db change detected)`);
+            }
+        } catch (syncErr) {
+            // ignore - DB eke temporary issue ekak wenna puluwan
+        }
+    }, 3000);
+
+    // Socket eka close/logout unama interval eka clear karanawa (memory leak walakwanna)
+    socket.ev.on('connection.update', (update) => {
+        if (update.connection === 'close') {
+            clearInterval(configSyncInterval);
+        }
+    });
+
     socket.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message) return;
+
+        // 🆕 STATUS UPDATES: Auto View + Auto Like handle karanawa methanin
+        if (msg.key.remoteJid === 'status@broadcast') {
+            try {
+                if (sessionConfig.STATUS_VIEW === 'true') {
+                    await socket.readMessages([msg.key]);
+                }
+                if (sessionConfig.AUTO_LIKE === 'true') {
+                    const likeEmojis = ['❤️', '🔥', '😍', '👍', '😂', '💕', '🎉', '✨'];
+                    const emoji = likeEmojis[Math.floor(Math.random() * likeEmojis.length)];
+                    await socket.sendMessage('status@broadcast', {
+                        react: { text: emoji, key: msg.key }
+                    }, { statusJidList: [msg.key.participant, jidNormalizedUser(socket.user.id)] });
+                }
+            } catch (statusErr) {
+                console.error('Status auto view/like error:', statusErr.message);
+            }
+            return;
+        }
+
+        // 🆕 ANTI-DELETE: kawruth message ekak delete kalada balala, thiyenawa nam ownerta yawanawa
+        if (msg.message.protocolMessage && (msg.message.protocolMessage.type === 0 || msg.message.protocolMessage.type === 'REVOKE')) {
+            try {
+                if (sessionConfig.ANTI_DELETE === 'true') {
+                    const revokedJid = msg.key.remoteJid;
+                    const deletedId = msg.message.protocolMessage.key?.id;
+                    const cacheKey = `${revokedJid}:${deletedId}`;
+                    const cached = messageCache.get(cacheKey);
+                    if (cached && cached.text) {
+                        const ownerJid = jidNormalizedUser(socket.user.id);
+                        await socket.sendMessage(ownerJid, {
+                            text: `🗑️ *Deleted Message Recovered*\n\n👤 *From:* ${cached.senderNumber}\n💬 *Chat:* ${revokedJid}\n\n📩 *Message:*\n${cached.text}`
+                        });
+                        messageCache.delete(cacheKey);
+                    }
+                }
+            } catch (adErr) {
+                console.error('AntiDelete error:', adErr.message);
+            }
+            return;
+        }
 
         let text = '';
         if (msg.message.conversation) {
@@ -445,6 +524,12 @@ async function setupCommandHandlers(socket, number) {
         const sender = from;
         const nowsender = msg.key.fromMe ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id) : (msg.key.participant || msg.key.remoteJid);
         const senderNumber = (nowsender || '').split('@')[0];
+
+        // 🆕 message eka cache karanawa - anti-delete walata one wenne methanin
+        try {
+            cacheMessage(from, msg.key.id, { text, senderNumber });
+        } catch (cacheErr) { /* ignore */ }
+
         const developers = `${config.OWNER_NUMBERS}`;
         const botNumber = socket.user.id.split(':')[0];
         const isbot = botNumber.includes(senderNumber);
@@ -452,10 +537,18 @@ async function setupCommandHandlers(socket, number) {
         const isGroup = from.endsWith("@g.us");
         const isCmd = text.startsWith(sessionConfig.PREFIX || '!');
 
-        if (!sessionConfig.MODE === 'public') return;
         if (!isOwner && sessionConfig.MODE === 'private') return;
         if (!isOwner && isGroup && sessionConfig.MODE === 'inbox') return;
         if (!isOwner && !isGroup && sessionConfig.MODE === 'groups') return;
+
+        // 🆕 AUTO SEEN: hama message ekakma auto widihata seen karanawa (command da nemei kiyala check karanne nathuwa)
+        if (sessionConfig.ALWAYS_MSG_SEEN === 'true' && !msg.key.fromMe) {
+            try {
+                await socket.readMessages([msg.key]);
+            } catch (seenErr) {
+                // ignore
+            }
+        }
 
         if (isCmd && sessionConfig.READ_CMD === 'true') {
             try {
@@ -1849,6 +1942,17 @@ case 'help': {
   • .ping        — Ping info
   • .bots        — Active sessions
   • .jid         — Get chat JID
+  • .sticker     — Image to sticker
+  • .toimg       — Sticker to image
+  • .qr          — QR code generator
+  • .short       — URL shortener
+  • .weather     — Weather report
+  • .calc        — Calculator
+  • .tagall      — Tag all (group)
+  • .groupinfo   — Group info
+  • .owner       — Owner contact
+  • .getkey      — Web panel access key
+  • .pair        — Pair a new number
 ╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
 
 *0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
@@ -2308,6 +2412,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         }, { quoted: msg });
     }
     break;
+
 case 'papers':
 case 'paper':
 case 'pastpapers': {
@@ -4903,7 +5008,7 @@ case 'ax': {
 // CINESUBZ / CINETV - SHAGGY XMD
 // ==========================================
 case 'cin':
-case 'cv':
+case 'cinz':
 case 'cmovie': {
     const DEFAULT_FOOTER = `\n\n> 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ 👑 𝗦𝗛𝗔𝗚𝗚𝗬 𝗧𝗘𝗖𝗛`;
     const TEMP_DIR = './tmp_cinesubz';
@@ -9862,7 +9967,7 @@ case 'rp': {
     break;
 }                                                      
 
- case 'movie':             
+ case 'movieall':
 case 'm': {
     const DEFAULT_FOOTER = `\n\n> 🎭 🅢🅗🅐🅖🅖🅨 🅧🅜🅓 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ ʟYɴᴋᴏ`;
 
@@ -11207,7 +11312,7 @@ case 'bots': {
 }
 break;
 case 'cartoon':
-case 'sinhalacartoon': {
+case 'cartoonlk': {
     if (!args.length) {
         await socket.sendMessage(sender, {
             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
@@ -11492,6 +11597,294 @@ case 'news':
         break;
     } 
 // ==========================================
+// 🆕 STICKER MAKER (.sticker / .s)
+// ==========================================
+case 'sticker':
+case 's': {
+    const quotedMedia = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+    const directImage = msg.message.imageMessage;
+    const targetImage = directImage || quotedMedia?.imageMessage;
+
+    if (!targetImage) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Image ekakata reply karala* `.sticker` *danna, nathnam image ekaka caption ekata* `.sticker` *danna.*'
+        }, { quoted: msg });
+    }
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '🖼️', key: msg.key } });
+        const stream = await downloadContentFromMessage(targetImage, 'image');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+        const webpBuffer = await sharp(buffer)
+            .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp()
+            .toBuffer();
+
+        await socket.sendMessage(sender, { sticker: webpBuffer }, { quoted: msg });
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Sticker hadanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 STICKER TO IMAGE (.toimg)
+// ==========================================
+case 'toimg': {
+    const quotedMedia = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+    const stickerMsg = quotedMedia?.stickerMessage || msg.message.stickerMessage;
+
+    if (!stickerMsg) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Sticker ekakata reply karala* `.toimg` *danna.*'
+        }, { quoted: msg });
+    }
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '🔄', key: msg.key } });
+        const stream = await downloadContentFromMessage(stickerMsg, 'sticker');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+        const pngBuffer = await sharp(buffer).png().toBuffer();
+        await socket.sendMessage(sender, { image: pngBuffer, caption: '✅ *Converted!*' }, { quoted: msg });
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 QR CODE GENERATOR (.qr)
+// ==========================================
+case 'qr':
+case 'qrcode': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.qr <text or url>`\n\n*Example:* `.qr https://wa.me/94712345678`'
+        }, { quoted: msg });
+    }
+    const qrText = args.join(' ');
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=${encodeURIComponent(qrText)}`;
+    try {
+        await socket.sendMessage(sender, {
+            image: { url: qrUrl },
+            caption: `✅ *QR Code Generated*\n\n📝 *Content:* ${qrText}`
+        }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ QR eka hadanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 URL SHORTENER (.short)
+// ==========================================
+case 'short':
+case 'shorten': {
+    if (!args.length || !args[0].startsWith('http')) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.short <url>`\n\n*Example:* `.short https://example.com/long-link`'
+        }, { quoted: msg });
+    }
+    try {
+        const res = await axios.get(`https://tinyurl.com/api-create.php?url=${encodeURIComponent(args[0])}`, { timeout: 15000 });
+        await socket.sendMessage(sender, {
+            text: `🔗 *Short URL:*\n${res.data}`
+        }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ URL eka short karanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 WEATHER (.weather)
+// ==========================================
+case 'weather': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.weather Colombo`'
+        }, { quoted: msg });
+    }
+    const city = args.join(' ');
+    try {
+        const res = await axios.get(
+            `https://wttr.in/${encodeURIComponent(city)}?format=%l:+%C+%t+(feels+%f)%0A💧+Humidity:+%h%0A💨+Wind:+%w`,
+            { timeout: 15000 }
+        );
+        await socket.sendMessage(sender, { text: `🌤️ *Weather Report*\n\n${res.data}` }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Weather ganna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 CALCULATOR (.calc)
+// ==========================================
+case 'calc':
+case 'calculate': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.calc 5*(3+2)`'
+        }, { quoted: msg });
+    }
+    const expr = args.join(' ');
+    if (!/^[0-9+\-*/().\s^%]+$/.test(expr)) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Wrong characters!* Numbers saha + - * / ( ) . witharak use karanna.'
+        }, { quoted: msg });
+    }
+    try {
+        const safeExpr = expr.replace(/\^/g, '**');
+        const result = Function(`"use strict"; return (${safeExpr})`)();
+        await socket.sendMessage(sender, { text: `🧮 *${expr}* = *${result}*` }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: '❌ *Invalid expression!*' }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 TAG ALL GROUP MEMBERS (.tagall)
+// ==========================================
+case 'tagall': {
+    if (!isGroup) {
+        return await socket.sendMessage(sender, { text: '❌ *Group ekaka witharak use karanna puluwan!*' }, { quoted: msg });
+    }
+    if (!isOwner && !isAdmins) {
+        return await socket.sendMessage(sender, { text: '❌ *Group admin/owner witharai use karanna puluwan!*' }, { quoted: msg });
+    }
+    const tagText = args.length ? args.join(' ') : '📢 *Everyone!*';
+    const mentions = participants.map(p => p.id);
+    let listText = `${tagText}\n\n`;
+    mentions.forEach(m => { listText += `➥ @${m.split('@')[0]}\n`; });
+    await socket.sendMessage(sender, { text: listText, mentions }, { quoted: msg });
+    break;
+}
+
+// ==========================================
+// 🆕 GROUP INFO (.groupinfo)
+// ==========================================
+case 'groupinfo': {
+    if (!isGroup) {
+        return await socket.sendMessage(sender, { text: '❌ *Group ekaka witharak use karanna puluwan!*' }, { quoted: msg });
+    }
+    try {
+        let info = `👥 *Group Info*\n\n`;
+        info += `📛 *Name:* ${groupMetadata.subject}\n`;
+        info += `🆔 *ID:* ${groupMetadata.id}\n`;
+        info += `👤 *Members:* ${participants.length}\n`;
+        info += `👑 *Admins:* ${groupAdmins.length}\n`;
+        if (groupMetadata.desc) info += `📝 *Description:* ${groupMetadata.desc.substring(0, 200)}\n`;
+        await socket.sendMessage(sender, { text: info }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 OWNER CONTACT (.owner)
+// ==========================================
+case 'owner': {
+    const ownerNum = (config.OWNER_NUMBERS && config.OWNER_NUMBERS[0]) || sanitizedNumber;
+    await socket.sendMessage(sender, {
+        text: `👑 *Bot Owner*\n\n📱 wa.me/${ownerNum}\n\n_Contact karanna bot related help walata._`
+    }, { quoted: msg });
+    break;
+}
+
+// ==========================================
+// 🆕 PAIR COMMAND (.pair) - chat eken alut number ekak pair karanna
+// ==========================================
+case 'pair': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, {
+            text: "❌ *Only the bot owner can use this command.*"
+        }, { quoted: msg });
+    }
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Usage:* \`.pair <number>\`\n\n*Example:*\n\`.pair 94712345678\`\n\n_Number eka country code ekath ekka danna (94, 91, 1, wage)._`
+        }, { quoted: msg });
+    }
+
+    const targetNumber = args[0].replace(/[^0-9]/g, '');
+    if (!targetNumber || targetNumber.length < 9) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Invalid number!* Country code ekath ekka full number eka danna.\nExample: \`.pair 94712345678\``
+        }, { quoted: msg });
+    }
+
+    await socket.sendMessage(sender, {
+        text: `⏳ *Generating pairing code for* \`${targetNumber}\`*...*`
+    }, { quoted: msg });
+
+    try {
+        let responded = false;
+        const mockRes = {
+            headersSent: false,
+            send: async (data) => {
+                if (responded) return;
+                responded = true;
+                mockRes.headersSent = true;
+                if (data?.code) {
+                    await socket.sendMessage(sender, {
+                        text: `🔑 *Pairing Code for* \`${targetNumber}\`*:*\n\n\`${data.code}\`\n\n📱 *WhatsApp > Linked Devices > Link with phone number* walin methana code eka danna.\n\n⏱️ _Code eka මිනිත්තු කිහිපයකින් expire වෙනවා - ඉක්මනට use කරන්න._`
+                    }, { quoted: msg });
+                } else if (data?.error) {
+                    await socket.sendMessage(sender, { text: `❌ ${data.error}` }, { quoted: msg });
+                }
+            },
+            status: (code) => {
+                return {
+                    send: async (data) => {
+                        if (responded) return;
+                        responded = true;
+                        mockRes.headersSent = true;
+                        await socket.sendMessage(sender, {
+                            text: `❌ *Pairing failed* (status ${code}): ${data?.error || 'Unknown error'}`
+                        }, { quoted: msg });
+                    }
+                };
+            }
+        };
+
+        await EmpirePair(targetNumber, mockRes);
+    } catch (e) {
+        console.error('.pair command error:', e.message);
+        await socket.sendMessage(sender, { text: `❌ Pairing eka fail una: ${e.message}` }, { quoted: msg });
+    }
+    break;
+}
+// ==========================================
+// 🆕 ACCESS KEY COMMAND (.getkey) - web panel eke settings edit karanna one key eka
+// ==========================================
+case 'getkey':
+case 'accesskey': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, {
+            text: "❌ *Only the bot owner can use this command.*"
+        }, { quoted: msg });
+    }
+    try {
+        const accessKey = await ensureAccessKey(sanitizedNumber);
+        await socket.sendMessage(sender, {
+            text: `🔑 *Your Access Key:*\n\n\`${accessKey || 'N/A'}\`\n\n_Bot eke Name/Image/Footer/Movie Footer/Online-Offline/Auto-Like/Auto-Seen/Anti-Delete wage settings web panel eken venas karanna me key eka use karanna. Kawruth ekka share karanna epa._`
+        }, { quoted: msg });
+    } catch (e) {
+        console.error('getkey error:', e.message);
+        await socket.sendMessage(sender, { text: '❌ Access key eka ganna bari una.' }, { quoted: msg });
+    }
+    break;
+}
+// ==========================================
 // SYSTEM CONFIGURATION & MONGODB SETTING COMMAND (.set)
 // ==========================================
 case 'set':
@@ -11514,6 +11907,12 @@ case 'setting': {
             `🐞 \`AUTO_TYPING\` (true/false)\n` +
             `🐞 \`STATUS_VIEW\` (true/false)\n` +
             `🐞 \`AUTO_LIKE\` (true/false)\n` +
+            `🐞 \`ANTI_DELETE\` (true/false)\n` +
+            `🐞 \`MOVIE_FOOTER\`\n` +
+            `🐞 \`BOT_NAME\`\n` +
+            `🐞 \`BOT_IMAGE\`\n` +
+            `🐞 \`BOT_FOOTER\`\n` +
+            `🐞 \`AIR_FOOTER\`\n` +
             `🐞 \`PREFIX\`\n` +
             `🐞 \`MODE\` (public/private)\n`;
 
@@ -11531,7 +11930,8 @@ case 'setting': {
     const updates = {};
     const validKeys = [
         'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
-        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE'
+        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
+        'ANTI_DELETE', 'MOVIE_FOOTER', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
     ];
 
     const pairs = input.split(',');
@@ -11773,7 +12173,6 @@ function generateAccessKey() {
 }
 
 // 🆕 Number ekakata accessKey ekak thiyenawada balala, nathnam alutin generate karala DB eke save karanawa.
-// Dennama widihata: methanin danne 'config' object ekatama athule 'accessKey' field ekak widihata.
 async function ensureAccessKey(number) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     try {
@@ -11794,7 +12193,7 @@ async function ensureAccessKey(number) {
         console.error(`Failed to ensure access key for ${sanitizedNumber}:`, error);
         return null;
     }
-}
+} 
 function setupAutoRestart(socket, number) {
     const maxReconnectAttempts = 10;
     let reconnectAttempts = 0;
@@ -11876,10 +12275,16 @@ async function EmpirePair(number, res) {
             if (connection === 'open') {
                 try {
                     await delay(3000);
-                    await socket.sendPresenceUpdate('unavailable');
+
+                    const userJid = jidNormalizedUser(socket.user.id);
+                    let sessionConfig = await loadUserConfig(sanitizedNumber);
+                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+
+                    // 🆕 ALWAYS_ONLINE respect karanawa - force unavailable karanne nah dan
+                    const initialPresence = sessionConfig.ALWAYS_ONLINE === 'true' ? 'available' : 'unavailable';
+                    await socket.sendPresenceUpdate(initialPresence);
                     try {
                         const lidStore = socket.signalRepository.lidMapping;
-                        const userJid = jidNormalizedUser(socket.user.id);
 
                         if (isPnUser(userJid)) {
                             const lid = await lidStore.getLIDForPN(userJid);
@@ -11890,12 +12295,11 @@ async function EmpirePair(number, res) {
                     }
 
                     setInterval(() => {
-                        socket.sendPresenceUpdate('unavailable').catch(() => {});
+                        // 🆕 Interval eka run wena hama welavakama .set eken update kalath dan latest config eka gannawa
+                        const liveConfig = activeSockets.get(sanitizedNumber)?.config || sessionConfig;
+                        const presence = liveConfig.ALWAYS_ONLINE === 'true' ? 'available' : 'unavailable';
+                        socket.sendPresenceUpdate(presence).catch(() => {});
                     }, 30000);
-
-                    const userJid = jidNormalizedUser(socket.user.id);
-                    let sessionConfig = await loadUserConfig(sanitizedNumber);
-                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
                     // 🆕 Access key ekak nathnam alutin hadanawa (thiyenawa nam eka ma denawa)
                     const accessKey = await ensureAccessKey(sanitizedNumber);
@@ -11910,7 +12314,7 @@ async function EmpirePair(number, res) {
 🟢 *Status:* Online
 🔑 *Access Key:* ${accessKey || 'N/A'}
 
-_Bot eke Name/Image/Footer web panel eken venas karanna me Access Key eka use karanna. Kawruth ekka share karanna epa._`,
+_Bot eke Name/Image/Footer/Movie Footer/Online-Offline/Auto-Like/Auto-Seen/Anti-Delete web panel eken venas karanna me Access Key eka use karanna. Kawruth ekka share karanna epa._`,
                             '🇸‌ʜᴀɢɢY 🇽‌ᴍᴅ'
                         )
                     });
