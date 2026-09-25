@@ -1,3 +1,4 @@
+
 import express from 'express';
 import fs from 'fs-extra';
 import path from 'path';
@@ -437,6 +438,32 @@ async function setupCommandHandlers(socket, number) {
     let sessionConfig = await loadUserConfig(sanitizedNumber);
     activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
+    // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath,
+    // hama tathpara 3katama check karala live widihata bot ekatama apply karanawa.
+    // (.set command eken direct widihata already apply wenawa - meka thawa web-panel walata)
+    let lastConfigSnapshot = JSON.stringify(sessionConfig);
+    const configSyncInterval = setInterval(async () => {
+        try {
+            const freshConfig = await loadUserConfig(sanitizedNumber);
+            const freshSnapshot = JSON.stringify(freshConfig);
+            if (freshSnapshot !== lastConfigSnapshot) {
+                sessionConfig = freshConfig;
+                lastConfigSnapshot = freshSnapshot;
+                activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                console.log(`🔄 Config auto-synced for ${sanitizedNumber} (web panel/db change detected)`);
+            }
+        } catch (syncErr) {
+            // ignore - DB eke temporary issue ekak wenna puluwan
+        }
+    }, 3000);
+
+    // Socket eka close/logout unama interval eka clear karanawa (memory leak walakwanna)
+    socket.ev.on('connection.update', (update) => {
+        if (update.connection === 'close') {
+            clearInterval(configSyncInterval);
+        }
+    });
+
     socket.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message) return;
@@ -511,7 +538,6 @@ async function setupCommandHandlers(socket, number) {
         const isGroup = from.endsWith("@g.us");
         const isCmd = text.startsWith(sessionConfig.PREFIX || '!');
 
-        if (!sessionConfig.MODE === 'public') return;
         if (!isOwner && sessionConfig.MODE === 'private') return;
         if (!isOwner && isGroup && sessionConfig.MODE === 'inbox') return;
         if (!isOwner && !isGroup && sessionConfig.MODE === 'groups') return;
@@ -1917,6 +1943,17 @@ case 'help': {
   • .ping        — Ping info
   • .bots        — Active sessions
   • .jid         — Get chat JID
+  • .sticker     — Image to sticker
+  • .toimg       — Sticker to image
+  • .qr          — QR code generator
+  • .short       — URL shortener
+  • .weather     — Weather report
+  • .calc        — Calculator
+  • .tagall      — Tag all (group)
+  • .groupinfo   — Group info
+  • .owner       — Owner contact
+  • .getkey      — Web panel access key
+  • .pair        — Pair a new number
 ╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
 
 *0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
@@ -4972,7 +5009,7 @@ case 'ax': {
 // CINESUBZ / CINETV - SHAGGY XMD
 // ==========================================
 case 'cin':
-case 'cv':
+case 'cinz':
 case 'cmovie': {
     const DEFAULT_FOOTER = `\n\n> 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ 👑 𝗦𝗛𝗔𝗚𝗚𝗬 𝗧𝗘𝗖𝗛`;
     const TEMP_DIR = './tmp_cinesubz';
@@ -9931,7 +9968,7 @@ case 'rp': {
     break;
 }                                                      
 
- case 'movie':             
+ case 'movieall':
 case 'm': {
     const DEFAULT_FOOTER = `\n\n> 🎭 🅢🅗🅐🅖🅖🅨 🅧🅜🅓 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ ʟYɴᴋᴏ`;
 
@@ -11276,7 +11313,7 @@ case 'bots': {
 }
 break;
 case 'cartoon':
-case 'sinhalacartoon': {
+case 'cartoonlk': {
     if (!args.length) {
         await socket.sendMessage(sender, {
             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
@@ -11560,6 +11597,210 @@ case 'news':
         }
         break;
     } 
+// ==========================================
+// 🆕 STICKER MAKER (.sticker / .s)
+// ==========================================
+case 'sticker':
+case 's': {
+    const quotedMedia = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+    const directImage = msg.message.imageMessage;
+    const targetImage = directImage || quotedMedia?.imageMessage;
+
+    if (!targetImage) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Image ekakata reply karala* `.sticker` *danna, nathnam image ekaka caption ekata* `.sticker` *danna.*'
+        }, { quoted: msg });
+    }
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '🖼️', key: msg.key } });
+        const stream = await downloadContentFromMessage(targetImage, 'image');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+        const webpBuffer = await sharp(buffer)
+            .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+            .webp()
+            .toBuffer();
+
+        await socket.sendMessage(sender, { sticker: webpBuffer }, { quoted: msg });
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Sticker hadanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 STICKER TO IMAGE (.toimg)
+// ==========================================
+case 'toimg': {
+    const quotedMedia = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+    const stickerMsg = quotedMedia?.stickerMessage || msg.message.stickerMessage;
+
+    if (!stickerMsg) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Sticker ekakata reply karala* `.toimg` *danna.*'
+        }, { quoted: msg });
+    }
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '🔄', key: msg.key } });
+        const stream = await downloadContentFromMessage(stickerMsg, 'sticker');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+        const pngBuffer = await sharp(buffer).png().toBuffer();
+        await socket.sendMessage(sender, { image: pngBuffer, caption: '✅ *Converted!*' }, { quoted: msg });
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 QR CODE GENERATOR (.qr)
+// ==========================================
+case 'qr':
+case 'qrcode': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.qr <text or url>`\n\n*Example:* `.qr https://wa.me/94712345678`'
+        }, { quoted: msg });
+    }
+    const qrText = args.join(' ');
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=${encodeURIComponent(qrText)}`;
+    try {
+        await socket.sendMessage(sender, {
+            image: { url: qrUrl },
+            caption: `✅ *QR Code Generated*\n\n📝 *Content:* ${qrText}`
+        }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ QR eka hadanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 URL SHORTENER (.short)
+// ==========================================
+case 'short':
+case 'shorten': {
+    if (!args.length || !args[0].startsWith('http')) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.short <url>`\n\n*Example:* `.short https://example.com/long-link`'
+        }, { quoted: msg });
+    }
+    try {
+        const res = await axios.get(`https://tinyurl.com/api-create.php?url=${encodeURIComponent(args[0])}`, { timeout: 15000 });
+        await socket.sendMessage(sender, {
+            text: `🔗 *Short URL:*\n${res.data}`
+        }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ URL eka short karanna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 WEATHER (.weather)
+// ==========================================
+case 'weather': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.weather Colombo`'
+        }, { quoted: msg });
+    }
+    const city = args.join(' ');
+    try {
+        const res = await axios.get(
+            `https://wttr.in/${encodeURIComponent(city)}?format=%l:+%C+%t+(feels+%f)%0A💧+Humidity:+%h%0A💨+Wind:+%w`,
+            { timeout: 15000 }
+        );
+        await socket.sendMessage(sender, { text: `🌤️ *Weather Report*\n\n${res.data}` }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Weather ganna bari una: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 CALCULATOR (.calc)
+// ==========================================
+case 'calc':
+case 'calculate': {
+    if (!args.length) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Usage:* `.calc 5*(3+2)`'
+        }, { quoted: msg });
+    }
+    const expr = args.join(' ');
+    if (!/^[0-9+\-*/().\s^%]+$/.test(expr)) {
+        return await socket.sendMessage(sender, {
+            text: '❌ *Wrong characters!* Numbers saha + - * / ( ) . witharak use karanna.'
+        }, { quoted: msg });
+    }
+    try {
+        const safeExpr = expr.replace(/\^/g, '**');
+        const result = Function(`"use strict"; return (${safeExpr})`)();
+        await socket.sendMessage(sender, { text: `🧮 *${expr}* = *${result}*` }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: '❌ *Invalid expression!*' }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 TAG ALL GROUP MEMBERS (.tagall)
+// ==========================================
+case 'tagall': {
+    if (!isGroup) {
+        return await socket.sendMessage(sender, { text: '❌ *Group ekaka witharak use karanna puluwan!*' }, { quoted: msg });
+    }
+    if (!isOwner && !isAdmins) {
+        return await socket.sendMessage(sender, { text: '❌ *Group admin/owner witharai use karanna puluwan!*' }, { quoted: msg });
+    }
+    const tagText = args.length ? args.join(' ') : '📢 *Everyone!*';
+    const mentions = participants.map(p => p.id);
+    let listText = `${tagText}\n\n`;
+    mentions.forEach(m => { listText += `➥ @${m.split('@')[0]}\n`; });
+    await socket.sendMessage(sender, { text: listText, mentions }, { quoted: msg });
+    break;
+}
+
+// ==========================================
+// 🆕 GROUP INFO (.groupinfo)
+// ==========================================
+case 'groupinfo': {
+    if (!isGroup) {
+        return await socket.sendMessage(sender, { text: '❌ *Group ekaka witharak use karanna puluwan!*' }, { quoted: msg });
+    }
+    try {
+        let info = `👥 *Group Info*\n\n`;
+        info += `📛 *Name:* ${groupMetadata.subject}\n`;
+        info += `🆔 *ID:* ${groupMetadata.id}\n`;
+        info += `👤 *Members:* ${participants.length}\n`;
+        info += `👑 *Admins:* ${groupAdmins.length}\n`;
+        if (groupMetadata.desc) info += `📝 *Description:* ${groupMetadata.desc.substring(0, 200)}\n`;
+        await socket.sendMessage(sender, { text: info }, { quoted: msg });
+    } catch (err) {
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 OWNER CONTACT (.owner)
+// ==========================================
+case 'owner': {
+    const ownerNum = (config.OWNER_NUMBERS && config.OWNER_NUMBERS[0]) || sanitizedNumber;
+    await socket.sendMessage(sender, {
+        text: `👑 *Bot Owner*\n\n📱 wa.me/${ownerNum}\n\n_Contact karanna bot related help walata._`
+    }, { quoted: msg });
+    break;
+}
+
 // ==========================================
 // 🆕 PAIR COMMAND (.pair) - chat eken alut number ekak pair karanna
 // ==========================================
