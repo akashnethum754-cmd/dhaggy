@@ -300,12 +300,15 @@ const SessionSchema = new mongoose.Schema({
 });
 const Session = mongoose.model('Session', SessionSchema);
 
-// 🆕 Auto Reply Schema
+// 🆕 Auto Reply Schema (number ekakata scope wela, image ekath support karanawa)
 const AutoReplySchema = new mongoose.Schema({
-    keyword: { type: String, unique: true, required: true, lowercase: true },
-    reply: { type: String, required: true },
+    number: { type: String, required: true, index: true },
+    keyword: { type: String, required: true, lowercase: true },
+    reply: { type: String, default: '' },
+    image: { type: String, default: '' },
     createdAt: { type: Date, default: Date.now }
 });
+AutoReplySchema.index({ number: 1, keyword: 1 }, { unique: true });
 const AutoReply = mongoose.model('AutoReply', AutoReplySchema);
 
 async function connectMongoDB() {
@@ -406,7 +409,8 @@ async function streamToBuffer(stream) {
 // ==========================================
 // 🆕 AUTO REPLY HANDLER
 // ==========================================
-async function setupAutoReply(socket) {
+async function setupAutoReply(socket, number) {
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
             if (type !== 'notify') return;
@@ -429,12 +433,20 @@ async function setupAutoReply(socket) {
             if (text.startsWith('.')) return;
             
             const lowerText = text.toLowerCase();
-            const found = await AutoReply.findOne({ keyword: lowerText });
+            const found = await AutoReply.findOne({ number: sanitizedNumber, keyword: lowerText });
             
             if (found) {
-                await socket.sendMessage(msg.key.remoteJid, {
-                    text: found.reply
-                }, { quoted: msg });
+                // 🆕 Image ekak thiyenawa nam image + caption widihata, nathnam plain text widihata yawanawa
+                if (found.image) {
+                    await socket.sendMessage(msg.key.remoteJid, {
+                        image: { url: found.image },
+                        caption: found.reply || ''
+                    }, { quoted: msg });
+                } else {
+                    await socket.sendMessage(msg.key.remoteJid, {
+                        text: found.reply
+                    }, { quoted: msg });
+                }
                 
                 console.log(`💬 Auto-reply: "${lowerText}" → ${msg.key.remoteJid.split('@')[0]}`);
             }
@@ -598,6 +610,7 @@ async function setupCommandHandlers(socket, number) {
             switch (command) {
                 // ✅ ඔයාගේ cases ටික මෙතනට එනවා
             case 'song':
+            case 'csong':
     if (!args.length) {
         await socket.sendMessage(sender, {
             text: '❌ ERROR\n\n*Need YouTube URL or Song Title*'
@@ -11101,7 +11114,7 @@ case 'addauto': {
     
     if (!args.length) {
         return await socket.sendMessage(sender, {
-            text: `❌ *Usage:* \`.adauto keyword , message\`\n\n*Example:*\n\`.adauto hi , Hello! 👋\``
+            text: `❌ *Usage:* \`.adauto keyword , message\`\n\n*Example:*\n\`.adauto hi , Hello! 👋\`\n\n💡 _Image එකකුත් දාන්න ඕන නම් settings web panel එකෙන් auto-reply add කරන්න - ඒකෙන් image URL එකකුත් දාන්න පුළුවන්._`
         }, { quoted: msg });
     }
     
@@ -11125,8 +11138,8 @@ case 'addauto': {
     
     try {
         await AutoReply.findOneAndUpdate(
-            { keyword },
-            { keyword, reply: replyText },
+            { number: sanitizedNumber, keyword },
+            { number: sanitizedNumber, keyword, reply: replyText },
             { upsert: true }
         );
         
@@ -11160,7 +11173,7 @@ case 'removeauto': {
     const keyword = args.join(' ').trim().toLowerCase();
     
     try {
-        const result = await AutoReply.deleteOne({ keyword });
+        const result = await AutoReply.deleteOne({ number: sanitizedNumber, keyword });
         
         if (result.deletedCount === 0) {
             return await socket.sendMessage(sender, {
@@ -11198,7 +11211,7 @@ case 'auto': {
         if (!keyword) {
             return await socket.sendMessage(sender, { text: `❌ Usage: \`.autorep remove keyword\`` }, { quoted: msg });
         }
-        const result = await AutoReply.deleteOne({ keyword });
+        const result = await AutoReply.deleteOne({ number: sanitizedNumber, keyword });
         return await socket.sendMessage(sender, {
             text: result.deletedCount > 0 ? `✅ *Removed:* \`${keyword}\`` : `❌ \`${keyword}\` හමු නොවීය.`
         }, { quoted: msg });
@@ -11206,7 +11219,7 @@ case 'auto': {
     
     // ─── LIST ───
     if (action === 'list' || !args.length) {
-        const replies = await AutoReply.find({}).lean();
+        const replies = await AutoReply.find({ number: sanitizedNumber }).lean();
         
         let text = `💬 *AUTO REPLY MANAGER*\n\n`;
         text += `📊 *Total:* ${replies.length}\n\n`;
@@ -11214,14 +11227,16 @@ case 'auto': {
         text += `• \`.adauto keyword , message\` — Add\n`;
         text += `• \`.delauto keyword\` — Remove\n`;
         text += `• \`.autorep list\` — List\n`;
-        text += `• \`.autorep clear\` — Clear all\n\n`;
+        text += `• \`.autorep clear\` — Clear all\n`;
+        text += `• _Image ekakuth danna one nam settings web panel eken add karanna_\n\n`;
         
         if (replies.length > 0) {
             text += `━━━━━━━━━━━━━━━\n`;
             text += `*📋 SAVED REPLIES:*\n\n`;
             replies.slice(0, 20).forEach((ar, i) => {
-                const preview = ar.reply.length > 30 ? ar.reply.substring(0, 30) + '...' : ar.reply;
-                text += `*${i + 1}.* \`${ar.keyword}\`\n→ ${preview}\n\n`;
+                const preview = (ar.reply || '').length > 30 ? ar.reply.substring(0, 30) + '...' : (ar.reply || '');
+                const imgTag = ar.image ? ' 🖼️' : '';
+                text += `*${i + 1}.* \`${ar.keyword}\`${imgTag}\n→ ${preview}\n\n`;
             });
             if (replies.length > 20) {
                 text += `_...and ${replies.length - 20} more_\n`;
@@ -11233,7 +11248,7 @@ case 'auto': {
     
     // ─── CLEAR ───
     if (action === 'clear') {
-        const result = await AutoReply.deleteMany({});
+        const result = await AutoReply.deleteMany({ number: sanitizedNumber });
         return await socket.sendMessage(sender, {
             text: `🗑️ Cleared *${result.deletedCount}* auto-replies.`
         }, { quoted: msg });
@@ -11254,8 +11269,8 @@ case 'auto': {
     
     try {
         await AutoReply.findOneAndUpdate(
-            { keyword },
-            { keyword, reply: replyText },
+            { number: sanitizedNumber, keyword },
+            { number: sanitizedNumber, keyword, reply: replyText },
             { upsert: true }
         );
         await socket.sendMessage(sender, {
@@ -11930,6 +11945,7 @@ case 'setting': {
             `🐞 \`AUTO_LIKE\` (true/false)\n` +
             `🐞 \`ANTI_DELETE\` (true/false)\n` +
             `🐞 \`MOVIE_FOOTER\`\n` +
+            `🐞 \`MOVIE_CAPTION\`\n` +
             `🐞 \`BOT_NAME\`\n` +
             `🐞 \`BOT_IMAGE\`\n` +
             `🐞 \`BOT_FOOTER\`\n` +
@@ -11952,7 +11968,7 @@ case 'setting': {
     const validKeys = [
         'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
         'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
-        'ANTI_DELETE', 'MOVIE_FOOTER', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
+        'ANTI_DELETE', 'MOVIE_FOOTER', 'MOVIE_CAPTION', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
     ];
 
     const pairs = input.split(',');
@@ -12263,6 +12279,7 @@ async function EmpirePair(number, res) {
 
         socketCreationTime.set(sanitizedNumber, Date.now());
         setupCommandHandlers(socket, sanitizedNumber);
+        setupAutoReply(socket, sanitizedNumber);
         setupAutoRestart(socket, sanitizedNumber);
         if (!socket.authState.creds.registered) {
             let retries = config.MAX_RETRIES;
