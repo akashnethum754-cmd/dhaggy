@@ -1,4 +1,3 @@
-
 import express from 'express';
 import fs from 'fs-extra';
 import path from 'path';
@@ -259,6 +258,21 @@ const config = {
     MAX_RETRIES: 3
 };
 const activeSockets = new Map();
+// 🆕 Interval tracking - number ekakata interval ekakma witharak thiyenna one (reconnect wela stack wenna epa)
+const configSyncIntervals = new Map();
+const presenceIntervals = new Map();
+
+function clearNumberIntervals(sanitizedNumber) {
+    if (configSyncIntervals.has(sanitizedNumber)) {
+        clearInterval(configSyncIntervals.get(sanitizedNumber));
+        configSyncIntervals.delete(sanitizedNumber);
+    }
+    if (presenceIntervals.has(sanitizedNumber)) {
+        clearInterval(presenceIntervals.get(sanitizedNumber));
+        presenceIntervals.delete(sanitizedNumber);
+    }
+}
+
 // 🆕 Anti-Delete feature ekata message content cache karagannawa (memory eke witharai, temporary)
 const messageCache = new Map(); // key: `${remoteJid}:${msgId}` -> { text, senderNumber, timestamp }
 const MESSAGE_CACHE_LIMIT = 500;
@@ -441,6 +455,11 @@ async function setupCommandHandlers(socket, number) {
     // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath,
     // hama tathpara 3katama check karala live widihata bot ekatama apply karanawa.
     // (.set command eken direct widihata already apply wenawa - meka thawa web-panel walata)
+    // ⚠️ IMPORTANT: pena interval ekak thiyenawa nam mulinma clear karanawa - reconnect wena hama welawakama
+    // alut interval ekak stack wela bot eka slow wena eka nawaththanna
+    if (configSyncIntervals.has(sanitizedNumber)) {
+        clearInterval(configSyncIntervals.get(sanitizedNumber));
+    }
     let lastConfigSnapshot = JSON.stringify(sessionConfig);
     const configSyncInterval = setInterval(async () => {
         try {
@@ -456,11 +475,12 @@ async function setupCommandHandlers(socket, number) {
             // ignore - DB eke temporary issue ekak wenna puluwan
         }
     }, 3000);
+    configSyncIntervals.set(sanitizedNumber, configSyncInterval);
 
     // Socket eka close/logout unama interval eka clear karanawa (memory leak walakwanna)
     socket.ev.on('connection.update', (update) => {
         if (update.connection === 'close') {
-            clearInterval(configSyncInterval);
+            clearNumberIntervals(sanitizedNumber);
         }
     });
 
@@ -12295,12 +12315,17 @@ async function EmpirePair(number, res) {
                         console.log(`⚠️ LID mapping not available yet for ${sanitizedNumber}:`, lidError.message);
                     }
 
-                    setInterval(() => {
+                    // ⚠️ IMPORTANT: pena presence interval ekak thiyenawa nam mulinma clear karanawa
+                    if (presenceIntervals.has(sanitizedNumber)) {
+                        clearInterval(presenceIntervals.get(sanitizedNumber));
+                    }
+                    const presenceInterval = setInterval(() => {
                         // 🆕 Interval eka run wena hama welavakama .set eken update kalath dan latest config eka gannawa
                         const liveConfig = activeSockets.get(sanitizedNumber)?.config || sessionConfig;
                         const presence = liveConfig.ALWAYS_ONLINE === 'true' ? 'available' : 'unavailable';
                         socket.sendPresenceUpdate(presence).catch(() => {});
                     }, 30000);
+                    presenceIntervals.set(sanitizedNumber, presenceInterval);
 
                     // 🆕 Access key ekak nathnam alutin hadanawa (thiyenawa nam eka ma denawa)
                     const accessKey = await ensureAccessKey(sanitizedNumber);
