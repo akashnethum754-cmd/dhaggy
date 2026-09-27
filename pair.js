@@ -258,8 +258,9 @@ const config = {
     MAX_RETRIES: 3
 };
 const activeSockets = new Map();
-// 🆕 Interval tracking - number ekakata interval ekakma witharak thiyenna one (reconnect wela stack wenna epa)
+// 🆕 Interval/Stream tracking - number ekakata interval/stream ekakma witharak thiyenna one (reconnect wela stack wenna epa)
 const configSyncIntervals = new Map();
+const configSyncStreams = new Map();
 const presenceIntervals = new Map();
 
 function clearNumberIntervals(sanitizedNumber) {
@@ -267,9 +268,33 @@ function clearNumberIntervals(sanitizedNumber) {
         clearInterval(configSyncIntervals.get(sanitizedNumber));
         configSyncIntervals.delete(sanitizedNumber);
     }
+    if (configSyncStreams.has(sanitizedNumber)) {
+        try { configSyncStreams.get(sanitizedNumber).close(); } catch (e) {}
+        configSyncStreams.delete(sanitizedNumber);
+    }
     if (presenceIntervals.has(sanitizedNumber)) {
         clearInterval(presenceIntervals.get(sanitizedNumber));
         presenceIntervals.delete(sanitizedNumber);
+    }
+    if (autoReplyStreams.has(sanitizedNumber)) {
+        try { autoReplyStreams.get(sanitizedNumber).close(); } catch (e) {}
+        autoReplyStreams.delete(sanitizedNumber);
+    }
+}
+
+// 🆕 Auto-reply rules number ekakata memory eke cache karagannawa - hama message ekakama DB query
+// ekak yawanna one nathuwa (eka message delay walata prashnayak una)
+const autoReplyCache = new Map(); // key: sanitizedNumber -> Map(keyword -> {reply, image})
+const autoReplyStreams = new Map();
+
+async function loadAutoReplyCache(sanitizedNumber) {
+    try {
+        const rules = await AutoReply.find({ number: sanitizedNumber }).lean();
+        const ruleMap = new Map();
+        rules.forEach(r => ruleMap.set(r.keyword, { reply: r.reply || '', image: r.image || '' }));
+        autoReplyCache.set(sanitizedNumber, ruleMap);
+    } catch (err) {
+        console.error(`Failed to load auto-reply cache for ${sanitizedNumber}:`, err.message);
     }
 }
 
@@ -411,6 +436,36 @@ async function streamToBuffer(stream) {
 // ==========================================
 async function setupAutoReply(socket, number) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
+
+    // 🆕 Mulinma cache eka load karagannawa
+    await loadAutoReplyCache(sanitizedNumber);
+
+    // 🆕 Change Stream eken - web panel/.adauto eken rule ekak add/wenas/delete unama
+    // cache eka background eke witharak refresh karanawa (message path eke DB query ekak nathuwa)
+    if (autoReplyStreams.has(sanitizedNumber)) {
+        try { autoReplyStreams.get(sanitizedNumber).close(); } catch (e) {}
+    }
+    try {
+        const arStream = AutoReply.watch(
+            [{ $match: { $or: [
+                { 'fullDocument.number': sanitizedNumber },
+                { operationType: 'delete' }
+            ] } }],
+            { fullDocument: 'updateLookup' }
+        );
+        arStream.on('change', () => {
+            // Delete events walata fullDocument eka thiyenne nathi nisa, number eka check karanna
+            // barii - ee nisa methanadi simple widihata cache eka refresh karala gannawa.
+            loadAutoReplyCache(sanitizedNumber);
+        });
+        arStream.on('error', (err) => {
+            console.error(`AutoReply change stream error for ${sanitizedNumber}:`, err.message);
+        });
+        autoReplyStreams.set(sanitizedNumber, arStream);
+    } catch (streamErr) {
+        console.error(`AutoReply change stream unavailable for ${sanitizedNumber}:`, streamErr.message);
+    }
+
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
         try {
             if (type !== 'notify') return;
@@ -433,7 +488,8 @@ async function setupAutoReply(socket, number) {
             if (text.startsWith('.')) return;
             
             const lowerText = text.toLowerCase();
-            const found = await AutoReply.findOne({ number: sanitizedNumber, keyword: lowerText });
+            // 🆕 DB query ekak nathuwa - memory cache ekenma check karanawa (super fast, delay nathuwa)
+            const found = autoReplyCache.get(sanitizedNumber)?.get(lowerText);
             
             if (found) {
                 // 🆕 Image ekak thiyenawa nam image + caption widihata, nathnam plain text widihata yawanawa
@@ -464,32 +520,56 @@ async function setupCommandHandlers(socket, number) {
     let sessionConfig = await loadUserConfig(sanitizedNumber);
     activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
-    // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath,
-    // hama tathpara 3katama check karala live widihata bot ekatama apply karanawa.
-    // (.set command eken direct widihata already apply wenawa - meka thawa web-panel walata)
-    // ⚠️ IMPORTANT: pena interval ekak thiyenawa nam mulinma clear karanawa - reconnect wena hama welawakama
-    // alut interval ekak stack wela bot eka slow wena eka nawaththanna
-    if (configSyncIntervals.has(sanitizedNumber)) {
-        clearInterval(configSyncIntervals.get(sanitizedNumber));
-    }
-    let lastConfigSnapshot = JSON.stringify(sessionConfig);
-    const configSyncInterval = setInterval(async () => {
-        try {
-            const freshConfig = await loadUserConfig(sanitizedNumber);
-            const freshSnapshot = JSON.stringify(freshConfig);
-            if (freshSnapshot !== lastConfigSnapshot) {
-                sessionConfig = freshConfig;
-                lastConfigSnapshot = freshSnapshot;
-                activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
-                console.log(`🔄 Config auto-synced for ${sanitizedNumber} (web panel/db change detected)`);
-            }
-        } catch (syncErr) {
-            // ignore - DB eke temporary issue ekak wenna puluwan
-        }
-    }, 3000);
-    configSyncIntervals.set(sanitizedNumber, configSyncInterval);
+    // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath, MongoDB Change Stream eken
+    // (polling nathuwa) real-time widihata bot ekatama apply karanawa. Meka DB ekata continuous load
+    // ekak dammema (poll karanne nathuwa) - change ekak welavakama witharak fire wenne.
+    // ⚠️ IMPORTANT: pena stream/interval ekak thiyenawa nam mulinma clear karanawa - reconnect wena hama welawakama
+    // alut ekak stack wela bot eka slow wena eka nawaththanna
+    clearNumberIntervals(sanitizedNumber);
 
-    // Socket eka close/logout unama interval eka clear karanawa (memory leak walakwanna)
+    try {
+        const changeStream = Session.watch(
+            [{ $match: { 'fullDocument.number': sanitizedNumber } }],
+            { fullDocument: 'updateLookup' }
+        );
+        changeStream.on('change', (change) => {
+            try {
+                if (change.fullDocument && change.fullDocument.number === sanitizedNumber) {
+                    sessionConfig = { ...config, ...change.fullDocument.config };
+                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                    console.log(`🔄 Config live-synced (change stream) for ${sanitizedNumber}`);
+                }
+            } catch (applyErr) {
+                console.error(`Change stream apply error for ${sanitizedNumber}:`, applyErr.message);
+            }
+        });
+        changeStream.on('error', (err) => {
+            console.error(`Change stream error for ${sanitizedNumber}:`, err.message);
+        });
+        configSyncStreams.set(sanitizedNumber, changeStream);
+    } catch (streamErr) {
+        // 🆕 Change Streams support wenne nathi MongoDB ekak nam (standalone, replica set nathi), polling walata
+        // fallback wenawa - eth load eka adu karanna 15 seconds ekakata (3s nemei) dammee
+        console.error(`Change stream unavailable for ${sanitizedNumber}, falling back to polling:`, streamErr.message);
+        let lastConfigSnapshot = JSON.stringify(sessionConfig);
+        const configSyncInterval = setInterval(async () => {
+            try {
+                const freshConfig = await loadUserConfig(sanitizedNumber);
+                const freshSnapshot = JSON.stringify(freshConfig);
+                if (freshSnapshot !== lastConfigSnapshot) {
+                    sessionConfig = freshConfig;
+                    lastConfigSnapshot = freshSnapshot;
+                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                    console.log(`🔄 Config auto-synced (polling fallback) for ${sanitizedNumber}`);
+                }
+            } catch (syncErr) {
+                // ignore - DB eke temporary issue ekak wenna puluwan
+            }
+        }, 15000);
+        configSyncIntervals.set(sanitizedNumber, configSyncInterval);
+    }
+
+    // Socket eka close/logout unama stream/interval eka clear karanawa (memory leak walakwanna)
     socket.ev.on('connection.update', (update) => {
         if (update.connection === 'close') {
             clearNumberIntervals(sanitizedNumber);
@@ -9503,6 +9583,272 @@ case 'pupil': {
     }
     break;
 } 
+                    // ==========================================
+// KSUBZONE - Korean Drama & Movie Sinhala Subtitles
+// ==========================================
+case 'ksubzone':
+case 'ksub':
+case 'kdrama': {
+    const DEFAULT_FOOTER = `\n\n> 🇰🇷 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗞𝗗𝗥𝗔𝗠𝗔 🇰🇷\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ 👑 𝗦𝗛𝗔𝗚𝗚𝗬 𝗧𝗘𝗖𝗛`;
+    const API_BASE = 'https://api.chamindu.site/api/v1/subtitles/ksubzone';
+    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
+
+    // ═══ No args → show Latest ═══
+    if (!args.length) {
+        await socket.sendMessage(sender, { text: '🔍 *Fetching latest Korean dramas...*' }, { quoted: msg });
+
+        try {
+            const latestRes = await axios.get(`${API_BASE}/latest`, {
+                params: { page: 1, api_key: API_KEY },
+                timeout: 30000
+            });
+
+            const latestData = latestRes.data;
+            if (!latestData.status || !latestData.data || latestData.data.length === 0) {
+                await socket.sendMessage(sender, {
+                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    caption: formatMessage(
+                        '❌ NO DATA',
+                        '*Latest dramas හමු නොවීය!*',
+                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                    )
+                }, { quoted: msg });
+                break;
+            }
+
+            const dramas = latestData.data.slice(0, 15);
+            let listText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 • 𝗟𝗔𝗧𝗘𝗦𝗧 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗦* 📺\n╭──────●➤\n*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+
+            dramas.forEach((item, index) => {
+                const num = (index + 1) < 10 ? `0${index + 1}` : `${index + 1}`;
+                const statusIcon = item.status === 'Published' ? '✅' : item.status === 'Upcoming' ? '⏳' : '📺';
+                listText += `*${num}* ➜ ${statusIcon} _${item.title}*\n    ↳ 📝 _${item.subtitles_progress || 'N/A'}_\n`;
+            });
+            listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+            const sentMsg = await socket.sendMessage(sender, {
+                image: { url: dramas[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: listText
+            }, { quoted: msg });
+
+            const messageID = sentMsg.key.id;
+
+            // ═══ Selection handler ═══
+            const handleLatestSelection = async ({ messages }) => {
+                const replyMek = messages?.[0];
+                if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
+
+                const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
+                const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+                if (!isReply) return;
+
+                const choice = parseInt(text) - 1;
+                if (isNaN(choice) || choice < 0 || choice >= dramas.length) {
+                    return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${dramas.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: replyMek });
+                }
+
+                socket.ev.off('messages.upsert', handleLatestSelection);
+                const selected = dramas[choice];
+                await showKSubZoneDetails(selected, replyMek);
+            };
+
+            socket.ev.on('messages.upsert', handleLatestSelection);
+            setTimeout(() => socket.ev.off('messages.upsert', handleLatestSelection), 300000);
+
+        } catch (err) {
+            console.error('[KSubZone] Latest error:', err.message);
+            await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+        }
+        break;
+    }
+
+    // ═══ Args → Search ═══
+    const query = args.join(' ').trim();
+    await socket.sendMessage(sender, { text: `🔍 *Searching KSubZone for:* _${query}_` }, { quoted: msg });
+
+    try {
+        const searchRes = await axios.get(`${API_BASE}/search`, {
+            params: { q: query, api_key: API_KEY },
+            timeout: 30000
+        });
+
+        const searchData = searchRes.data;
+        if (!searchData.status || !searchData.data || searchData.data.length === 0) {
+            await socket.sendMessage(sender, {
+                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: formatMessage(
+                    '❌ NO RESULTS',
+                    `*"${query}" සඳහා ප්‍රතිඵල හමු නොවීය!*`,
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const results = searchData.data.slice(0, 20);
+        let listText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 𝗦𝗘𝗔𝗥𝗖𝗛 : _${query}_* 🔍\n╭──────●➤\n*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
+
+        results.forEach((item, index) => {
+            const num = (index + 1) < 10 ? `0${index + 1}` : `${index + 1}`;
+            const typeIcon = item.type === 'movie' ? '🎬' : '📺';
+            listText += `*${num}* ➜ ${typeIcon} _${item.title}*\n    ↳ ⭐ _${item.imdb_rating || 'N/A'}_ | 📝 _${item.subtitles_progress || 'N/A'}_\n`;
+        });
+        listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+        const sentMsg = await socket.sendMessage(sender, {
+            image: { url: results[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            caption: listText
+        }, { quoted: msg });
+
+        const messageID = sentMsg.key.id;
+
+        const handleSearchSelection = async ({ messages }) => {
+            const replyMek = messages?.[0];
+            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
+
+            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
+            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+            if (!isReply) return;
+
+            const choice = parseInt(text) - 1;
+            if (isNaN(choice) || choice < 0 || choice >= results.length) {
+                return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${results.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: replyMek });
+            }
+
+            socket.ev.off('messages.upsert', handleSearchSelection);
+            const selected = results[choice];
+            await showKSubZoneDetails(selected, replyMek);
+        };
+
+        socket.ev.on('messages.upsert', handleSearchSelection);
+        setTimeout(() => socket.ev.off('messages.upsert', handleSearchSelection), 300000);
+
+    } catch (err) {
+        console.error('[KSubZone] Search error:', err.message);
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+
+    // ═══ Helper: Show Drama/Movie Details & Episodes ═══
+    async function showKSubZoneDetails(item, replyMek) {
+        try {
+            await socket.sendMessage(sender, { text: '📽️ *Fetching details & subtitles...*' }, { quoted: replyMek });
+
+            const infoRes = await axios.get(`${API_BASE}/infodl`, {
+                params: { url: item.link, api_key: API_KEY },
+                timeout: 60000
+            });
+
+            const info = infoRes.data;
+            if (!info.status) throw new Error('Failed to fetch details');
+
+            // ═══ Details Caption ═══
+            let detailsText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 • 𝗗𝗘𝗧𝗔𝗜𝗟𝗦* 📺\n\n`;
+            detailsText += `🎬 *${info.title}*\n`;
+            if (info.original_title) detailsText += `🈁 *Original:* _${info.original_title}_\n`;
+            detailsText += `📅 *Year:* ${info.year || 'N/A'}\n`;
+            detailsText += `⭐ *IMDb:* ${info.imdb_rating || 'N/A'}/10\n`;
+            if (info.runtime) detailsText += `⏳ *Runtime:* ${info.runtime} min\n`;
+            if (info.director) detailsText += `🎬 *Director:* ${info.director}\n`;
+            if (info.genres?.length) detailsText += `🎭 *Genres:* ${info.genres.slice(0, 5).join(', ')}\n`;
+            detailsText += `📺 *Total Episodes:* ${info.total_episodes || 'N/A'}\n`;
+            detailsText += `📡 *Status:* ${info.status_label || 'N/A'}\n`;
+            if (info.synopsis) {
+                const syn = info.synopsis.length > 300 ? info.synopsis.substring(0, 300) + '...' : info.synopsis;
+                detailsText += `\n📖 *Story:*\n_${syn}_\n`;
+            }
+            detailsText += `\n🔗 *Source:* ${info.source_url || item.link}`;
+            detailsText += DEFAULT_FOOTER;
+
+            const infoMsg = await socket.sendMessage(sender, {
+                image: { url: info.poster || item.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                caption: detailsText
+            }, { quoted: replyMek });
+
+            // ═══ Episodes List ═══
+            const episodes = info.episodes || [];
+            const subtitles = info.subtitles || info.downloads || [];
+
+            if (episodes.length === 0 && subtitles.length === 0) {
+                return socket.sendMessage(sender, {
+                    text: `⚠️ *No subtitles available for this drama.*${DEFAULT_FOOTER}`
+                }, { quoted: replyMek });
+            }
+
+            let listText = `📥 *𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘 𝗦𝗨𝗕𝗧𝗜𝗧𝗟𝗘𝗦 (${subtitles.length})*\n\n`;
+            listText += `📌 *Reply with episode number to download .srt file*\n\n`;
+
+            const displayList = subtitles.slice(0, 30);
+            displayList.forEach((sub, i) => {
+                const num = (i + 1) < 10 ? `0${i + 1}` : `${i + 1}`;
+                const sizeKB = sub.size_bytes ? (sub.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A';
+                const downloads = sub.downloads ? ` • ⬇️ ${sub.downloads}` : '';
+                listText += `*${num}* ➜ 📝 _Episode ${sub.episode}_ [${sub.language}] (${sizeKB})${downloads}\n`;
+            });
+
+            if (subtitles.length > 30) {
+                listText += `\n_...and ${subtitles.length - 30} more_`;
+            }
+
+            listText += DEFAULT_FOOTER;
+
+            const subsMsg = await socket.sendMessage(sender, { text: listText }, { quoted: infoMsg });
+            const subsMsgID = subsMsg.key.id;
+
+            // ═══ Subtitle Selection Handler ═══
+            const handleSubtitleSelection = async ({ messages: subMsgs }) => {
+                const subMek = subMsgs?.[0];
+                if (!subMek?.message || subMek.key.remoteJid !== sender) return;
+
+                const subText = (subMek.message.conversation || subMek.message.extendedTextMessage?.text || '').trim();
+                const isSubReply = subMek.message.extendedTextMessage?.contextInfo?.stanzaId === subsMsgID;
+                if (!isSubReply) return;
+
+                const subIdx = parseInt(subText) - 1;
+                if (isNaN(subIdx) || subIdx < 0 || subIdx >= displayList.length) {
+                    return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${displayList.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: subMek });
+                }
+
+                socket.ev.off('messages.upsert', handleSubtitleSelection);
+
+                const selected = displayList[subIdx];
+                const fileName = `${(info.title || 'KSubZone').replace(/[^a-zA-Z0-9 ]/g, '').trim()} - S01E${String(selected.episode).padStart(2, '0')} [${selected.language}].srt`;
+
+                await socket.sendMessage(sender, { react: { text: '📥', key: subMek.key } });
+                await socket.sendMessage(sender, {
+                    text: `⏳ *Downloading:* Episode ${selected.episode}\n📝 *Language:* ${selected.language}\n📦 *Size:* ${selected.size_bytes ? (selected.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A'}\n\n_කරුණාකර රැඳී සිටින්න..._`
+                }, { quoted: subMek });
+
+                try {
+                    await socket.sendMessage(sender, {
+                        document: { url: selected.link },
+                        mimetype: 'application/x-subrip',
+                        fileName: fileName,
+                        caption: `✅ *KSUBZONE SUBTITLE*\n\n🎬 *Title:* ${info.title}\n📺 *Episode:* ${selected.episode}\n📝 *Language:* ${selected.language}\n📦 *Size:* ${selected.size_bytes ? (selected.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A'}\n\n> 🇰🇷 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗞𝗗𝗥𝗔𝗠𝗔 🇰🇷`
+                    }, { quoted: subMek });
+
+                    await socket.sendMessage(sender, { react: { text: '✅', key: subMek.key } });
+
+                } catch (sendErr) {
+                    console.error('[KSubZone] Send error:', sendErr.message);
+                    await socket.sendMessage(sender, {
+                        text: `❌ *Send fail:* _${sendErr.message}_\n\n🔗 *Direct Link:*\n${selected.link}`
+                    }, { quoted: subMek });
+                }
+            };
+
+            socket.ev.on('messages.upsert', handleSubtitleSelection);
+            setTimeout(() => socket.ev.off('messages.upsert', handleSubtitleSelection), 300000);
+
+        } catch (err) {
+            console.error('[KSubZone] Details error:', err.message);
+            await socket.sendMessage(sender, {
+                text: `❌ *Details Error:* _${err.message}_${DEFAULT_FOOTER}`
+            }, { quoted: replyMek });
+        }
+    }
+
+    break;
+                                         }
 // ==========================================
 // MOVIESUBLK.COM - SHAGGY XMD (GDrive + Direct)
 // ==========================================
@@ -11142,6 +11488,7 @@ case 'addauto': {
             { number: sanitizedNumber, keyword, reply: replyText },
             { upsert: true }
         );
+        await loadAutoReplyCache(sanitizedNumber); // 🆕 instant cache refresh
         
         await socket.sendMessage(sender, {
             text: `✅ *Auto-reply Added!*\n\n🔑 *Keyword:* \`${keyword}\`\n💬 *Reply:* _${replyText}_\n\n💡 _User "${keyword}" type කරාම bot reply එක යවනවා._`
@@ -11174,6 +11521,7 @@ case 'removeauto': {
     
     try {
         const result = await AutoReply.deleteOne({ number: sanitizedNumber, keyword });
+        await loadAutoReplyCache(sanitizedNumber); // 🆕 instant cache refresh
         
         if (result.deletedCount === 0) {
             return await socket.sendMessage(sender, {
@@ -11212,6 +11560,7 @@ case 'auto': {
             return await socket.sendMessage(sender, { text: `❌ Usage: \`.autorep remove keyword\`` }, { quoted: msg });
         }
         const result = await AutoReply.deleteOne({ number: sanitizedNumber, keyword });
+        await loadAutoReplyCache(sanitizedNumber); // 🆕 instant cache refresh
         return await socket.sendMessage(sender, {
             text: result.deletedCount > 0 ? `✅ *Removed:* \`${keyword}\`` : `❌ \`${keyword}\` හමු නොවීය.`
         }, { quoted: msg });
@@ -11249,6 +11598,7 @@ case 'auto': {
     // ─── CLEAR ───
     if (action === 'clear') {
         const result = await AutoReply.deleteMany({ number: sanitizedNumber });
+        await loadAutoReplyCache(sanitizedNumber); // 🆕 instant cache refresh
         return await socket.sendMessage(sender, {
             text: `🗑️ Cleared *${result.deletedCount}* auto-replies.`
         }, { quoted: msg });
@@ -11273,6 +11623,7 @@ case 'auto': {
             { number: sanitizedNumber, keyword, reply: replyText },
             { upsert: true }
         );
+        await loadAutoReplyCache(sanitizedNumber); // 🆕 instant cache refresh
         await socket.sendMessage(sender, {
             text: `✅ *Auto-reply Added!*\n\n🔑 \`${keyword}\`\n💬 _${replyText}_`
         }, { quoted: msg });
