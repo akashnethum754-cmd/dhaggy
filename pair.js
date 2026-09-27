@@ -650,6 +650,21 @@ async function setupCommandHandlers(socket, number) {
         const isGroup = from.endsWith("@g.us");
         const isCmd = text.startsWith(sessionConfig.PREFIX || '!');
 
+        // 🆕 SUBSCRIPTION / LICENSE CHECK - master owner ge number eka witharai free.
+        // wenath number ekakata license ekak nathnam/ivara wela nam, commands process karanne nah.
+        const isMasterBotNumber = (config.OWNER_NUMBERS || []).includes(sanitizedNumber);
+        if (!isMasterBotNumber) {
+            const expiryStr = sessionConfig.LICENSE_EXPIRY;
+            const expiryTime = expiryStr ? new Date(expiryStr).getTime() : 0;
+            const isLicensed = expiryTime > Date.now();
+            if (!isLicensed && isCmd) {
+                await socket.sendMessage(sender, {
+                    text: `⛔ *Subscription Expired!*\n\n_Mee bot eka use karanna active subscription ekak nathi/ivara wela._\n\n💳 *Subscribe karanna owner ta contact karanna:*\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
+                }, { quoted: msg });
+                return;
+            }
+        }
+
         if (!isOwner && sessionConfig.MODE === 'private') return;
         if (!isOwner && isGroup && sessionConfig.MODE === 'inbox') return;
         if (!isOwner && !isGroup && sessionConfig.MODE === 'groups') return;
@@ -2084,6 +2099,8 @@ case 'help': {
   • .restart     — Restart bot
   • .stop        — Stop bot
   • .sessions    — Active sessions
+  • .add         — Add subscription (master only)
+  • .license     — Check subscription status
 ╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
 
 ⚠️ *Admin only commands*
@@ -9583,272 +9600,6 @@ case 'pupil': {
     }
     break;
 } 
-                    // ==========================================
-// KSUBZONE - Korean Drama & Movie Sinhala Subtitles
-// ==========================================
-case 'ksubzone':
-case 'ksub':
-case 'kdrama': {
-    const DEFAULT_FOOTER = `\n\n> 🇰🇷 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗞𝗗𝗥𝗔𝗠𝗔 🇰🇷\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ 👑 𝗦𝗛𝗔𝗚𝗚𝗬 𝗧𝗘𝗖𝗛`;
-    const API_BASE = 'https://api.chamindu.site/api/v1/subtitles/ksubzone';
-    const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
-
-    // ═══ No args → show Latest ═══
-    if (!args.length) {
-        await socket.sendMessage(sender, { text: '🔍 *Fetching latest Korean dramas...*' }, { quoted: msg });
-
-        try {
-            const latestRes = await axios.get(`${API_BASE}/latest`, {
-                params: { page: 1, api_key: API_KEY },
-                timeout: 30000
-            });
-
-            const latestData = latestRes.data;
-            if (!latestData.status || !latestData.data || latestData.data.length === 0) {
-                await socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: formatMessage(
-                        '❌ NO DATA',
-                        '*Latest dramas හමු නොවීය!*',
-                        `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                    )
-                }, { quoted: msg });
-                break;
-            }
-
-            const dramas = latestData.data.slice(0, 15);
-            let listText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 • 𝗟𝗔𝗧𝗘𝗦𝗧 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗦* 📺\n╭──────●➤\n*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
-
-            dramas.forEach((item, index) => {
-                const num = (index + 1) < 10 ? `0${index + 1}` : `${index + 1}`;
-                const statusIcon = item.status === 'Published' ? '✅' : item.status === 'Upcoming' ? '⏳' : '📺';
-                listText += `*${num}* ➜ ${statusIcon} _${item.title}*\n    ↳ 📝 _${item.subtitles_progress || 'N/A'}_\n`;
-            });
-            listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
-
-            const sentMsg = await socket.sendMessage(sender, {
-                image: { url: dramas[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: listText
-            }, { quoted: msg });
-
-            const messageID = sentMsg.key.id;
-
-            // ═══ Selection handler ═══
-            const handleLatestSelection = async ({ messages }) => {
-                const replyMek = messages?.[0];
-                if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-
-                const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-                const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
-                if (!isReply) return;
-
-                const choice = parseInt(text) - 1;
-                if (isNaN(choice) || choice < 0 || choice >= dramas.length) {
-                    return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${dramas.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: replyMek });
-                }
-
-                socket.ev.off('messages.upsert', handleLatestSelection);
-                const selected = dramas[choice];
-                await showKSubZoneDetails(selected, replyMek);
-            };
-
-            socket.ev.on('messages.upsert', handleLatestSelection);
-            setTimeout(() => socket.ev.off('messages.upsert', handleLatestSelection), 300000);
-
-        } catch (err) {
-            console.error('[KSubZone] Latest error:', err.message);
-            await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
-        }
-        break;
-    }
-
-    // ═══ Args → Search ═══
-    const query = args.join(' ').trim();
-    await socket.sendMessage(sender, { text: `🔍 *Searching KSubZone for:* _${query}_` }, { quoted: msg });
-
-    try {
-        const searchRes = await axios.get(`${API_BASE}/search`, {
-            params: { q: query, api_key: API_KEY },
-            timeout: 30000
-        });
-
-        const searchData = searchRes.data;
-        if (!searchData.status || !searchData.data || searchData.data.length === 0) {
-            await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: formatMessage(
-                    '❌ NO RESULTS',
-                    `*"${query}" සඳහා ප්‍රතිඵල හමු නොවීය!*`,
-                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
-                )
-            }, { quoted: msg });
-            break;
-        }
-
-        const results = searchData.data.slice(0, 20);
-        let listText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 𝗦𝗘𝗔𝗥𝗖𝗛 : _${query}_* 🔍\n╭──────●➤\n*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*\n╰──────────●➤\n╭──────●➤\n`;
-
-        results.forEach((item, index) => {
-            const num = (index + 1) < 10 ? `0${index + 1}` : `${index + 1}`;
-            const typeIcon = item.type === 'movie' ? '🎬' : '📺';
-            listText += `*${num}* ➜ ${typeIcon} _${item.title}*\n    ↳ ⭐ _${item.imdb_rating || 'N/A'}_ | 📝 _${item.subtitles_progress || 'N/A'}_\n`;
-        });
-        listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
-
-        const sentMsg = await socket.sendMessage(sender, {
-            image: { url: results[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: listText
-        }, { quoted: msg });
-
-        const messageID = sentMsg.key.id;
-
-        const handleSearchSelection = async ({ messages }) => {
-            const replyMek = messages?.[0];
-            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-
-            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
-            if (!isReply) return;
-
-            const choice = parseInt(text) - 1;
-            if (isNaN(choice) || choice < 0 || choice >= results.length) {
-                return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${results.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: replyMek });
-            }
-
-            socket.ev.off('messages.upsert', handleSearchSelection);
-            const selected = results[choice];
-            await showKSubZoneDetails(selected, replyMek);
-        };
-
-        socket.ev.on('messages.upsert', handleSearchSelection);
-        setTimeout(() => socket.ev.off('messages.upsert', handleSearchSelection), 300000);
-
-    } catch (err) {
-        console.error('[KSubZone] Search error:', err.message);
-        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
-    }
-
-    // ═══ Helper: Show Drama/Movie Details & Episodes ═══
-    async function showKSubZoneDetails(item, replyMek) {
-        try {
-            await socket.sendMessage(sender, { text: '📽️ *Fetching details & subtitles...*' }, { quoted: replyMek });
-
-            const infoRes = await axios.get(`${API_BASE}/infodl`, {
-                params: { url: item.link, api_key: API_KEY },
-                timeout: 60000
-            });
-
-            const info = infoRes.data;
-            if (!info.status) throw new Error('Failed to fetch details');
-
-            // ═══ Details Caption ═══
-            let detailsText = `🇰🇷 *𝗞𝗦𝗨𝗕𝗭𝗢𝗡𝗘 • 𝗗𝗘𝗧𝗔𝗜𝗟𝗦* 📺\n\n`;
-            detailsText += `🎬 *${info.title}*\n`;
-            if (info.original_title) detailsText += `🈁 *Original:* _${info.original_title}_\n`;
-            detailsText += `📅 *Year:* ${info.year || 'N/A'}\n`;
-            detailsText += `⭐ *IMDb:* ${info.imdb_rating || 'N/A'}/10\n`;
-            if (info.runtime) detailsText += `⏳ *Runtime:* ${info.runtime} min\n`;
-            if (info.director) detailsText += `🎬 *Director:* ${info.director}\n`;
-            if (info.genres?.length) detailsText += `🎭 *Genres:* ${info.genres.slice(0, 5).join(', ')}\n`;
-            detailsText += `📺 *Total Episodes:* ${info.total_episodes || 'N/A'}\n`;
-            detailsText += `📡 *Status:* ${info.status_label || 'N/A'}\n`;
-            if (info.synopsis) {
-                const syn = info.synopsis.length > 300 ? info.synopsis.substring(0, 300) + '...' : info.synopsis;
-                detailsText += `\n📖 *Story:*\n_${syn}_\n`;
-            }
-            detailsText += `\n🔗 *Source:* ${info.source_url || item.link}`;
-            detailsText += DEFAULT_FOOTER;
-
-            const infoMsg = await socket.sendMessage(sender, {
-                image: { url: info.poster || item.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                caption: detailsText
-            }, { quoted: replyMek });
-
-            // ═══ Episodes List ═══
-            const episodes = info.episodes || [];
-            const subtitles = info.subtitles || info.downloads || [];
-
-            if (episodes.length === 0 && subtitles.length === 0) {
-                return socket.sendMessage(sender, {
-                    text: `⚠️ *No subtitles available for this drama.*${DEFAULT_FOOTER}`
-                }, { quoted: replyMek });
-            }
-
-            let listText = `📥 *𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘 𝗦𝗨𝗕𝗧𝗜𝗧𝗟𝗘𝗦 (${subtitles.length})*\n\n`;
-            listText += `📌 *Reply with episode number to download .srt file*\n\n`;
-
-            const displayList = subtitles.slice(0, 30);
-            displayList.forEach((sub, i) => {
-                const num = (i + 1) < 10 ? `0${i + 1}` : `${i + 1}`;
-                const sizeKB = sub.size_bytes ? (sub.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A';
-                const downloads = sub.downloads ? ` • ⬇️ ${sub.downloads}` : '';
-                listText += `*${num}* ➜ 📝 _Episode ${sub.episode}_ [${sub.language}] (${sizeKB})${downloads}\n`;
-            });
-
-            if (subtitles.length > 30) {
-                listText += `\n_...and ${subtitles.length - 30} more_`;
-            }
-
-            listText += DEFAULT_FOOTER;
-
-            const subsMsg = await socket.sendMessage(sender, { text: listText }, { quoted: infoMsg });
-            const subsMsgID = subsMsg.key.id;
-
-            // ═══ Subtitle Selection Handler ═══
-            const handleSubtitleSelection = async ({ messages: subMsgs }) => {
-                const subMek = subMsgs?.[0];
-                if (!subMek?.message || subMek.key.remoteJid !== sender) return;
-
-                const subText = (subMek.message.conversation || subMek.message.extendedTextMessage?.text || '').trim();
-                const isSubReply = subMek.message.extendedTextMessage?.contextInfo?.stanzaId === subsMsgID;
-                if (!isSubReply) return;
-
-                const subIdx = parseInt(subText) - 1;
-                if (isNaN(subIdx) || subIdx < 0 || subIdx >= displayList.length) {
-                    return socket.sendMessage(sender, { text: `❌ කරුණාකර 1 - ${displayList.length} අතර අංකයක් ලබාදෙන්න!` }, { quoted: subMek });
-                }
-
-                socket.ev.off('messages.upsert', handleSubtitleSelection);
-
-                const selected = displayList[subIdx];
-                const fileName = `${(info.title || 'KSubZone').replace(/[^a-zA-Z0-9 ]/g, '').trim()} - S01E${String(selected.episode).padStart(2, '0')} [${selected.language}].srt`;
-
-                await socket.sendMessage(sender, { react: { text: '📥', key: subMek.key } });
-                await socket.sendMessage(sender, {
-                    text: `⏳ *Downloading:* Episode ${selected.episode}\n📝 *Language:* ${selected.language}\n📦 *Size:* ${selected.size_bytes ? (selected.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A'}\n\n_කරුණාකර රැඳී සිටින්න..._`
-                }, { quoted: subMek });
-
-                try {
-                    await socket.sendMessage(sender, {
-                        document: { url: selected.link },
-                        mimetype: 'application/x-subrip',
-                        fileName: fileName,
-                        caption: `✅ *KSUBZONE SUBTITLE*\n\n🎬 *Title:* ${info.title}\n📺 *Episode:* ${selected.episode}\n📝 *Language:* ${selected.language}\n📦 *Size:* ${selected.size_bytes ? (selected.size_bytes / 1024).toFixed(0) + ' KB' : 'N/A'}\n\n> 🇰🇷 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗞𝗗𝗥𝗔𝗠𝗔 🇰🇷`
-                    }, { quoted: subMek });
-
-                    await socket.sendMessage(sender, { react: { text: '✅', key: subMek.key } });
-
-                } catch (sendErr) {
-                    console.error('[KSubZone] Send error:', sendErr.message);
-                    await socket.sendMessage(sender, {
-                        text: `❌ *Send fail:* _${sendErr.message}_\n\n🔗 *Direct Link:*\n${selected.link}`
-                    }, { quoted: subMek });
-                }
-            };
-
-            socket.ev.on('messages.upsert', handleSubtitleSelection);
-            setTimeout(() => socket.ev.off('messages.upsert', handleSubtitleSelection), 300000);
-
-        } catch (err) {
-            console.error('[KSubZone] Details error:', err.message);
-            await socket.sendMessage(sender, {
-                text: `❌ *Details Error:* _${err.message}_${DEFAULT_FOOTER}`
-            }, { quoted: replyMek });
-        }
-    }
-
-    break;
-                                         }
 // ==========================================
 // MOVIESUBLK.COM - SHAGGY XMD (GDrive + Direct)
 // ==========================================
@@ -12248,6 +11999,113 @@ case 'pair': {
         console.error('.pair command error:', e.message);
         await socket.sendMessage(sender, { text: `❌ Pairing eka fail una: ${e.message}` }, { quoted: msg });
     }
+    break;
+}
+// ==========================================
+// 🆕 SUBSCRIPTION MANAGEMENT (.add) - master owner witharai use karanna one
+// ==========================================
+case 'add': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, {
+            text: "❌ *Master owner witharai use karanna puluwan!*"
+        }, { quoted: msg });
+    }
+    if (!args.length || !text.includes('|')) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Usage:* \`.add <number> | <months>\`\n\n*Example:*\n\`.add 94712345678 | 1\`\n\n_Masa 1ka subscription ekak denna._`
+        }, { quoted: msg });
+    }
+
+    const rawInput = text.slice((sessionConfig.PREFIX || '!').length + command.length).trim();
+    const parts = rawInput.split('|');
+    if (parts.length < 2) {
+        return await socket.sendMessage(sender, {
+            text: `❌ *Usage:* \`.add <number> | <months>\``
+        }, { quoted: msg });
+    }
+
+    const targetNumber = parts[0].trim().replace(/[^0-9]/g, '');
+    const months = parseInt(parts[1].trim());
+
+    if (!targetNumber || targetNumber.length < 9) {
+        return await socket.sendMessage(sender, { text: `❌ *Invalid number!*` }, { quoted: msg });
+    }
+    if (isNaN(months) || months <= 0) {
+        return await socket.sendMessage(sender, { text: `❌ *Invalid months!* Number ekak danna (1, 2, 3...).` }, { quoted: msg });
+    }
+
+    try {
+        const targetSession = await Session.findOne({ number: targetNumber }, 'number');
+        if (!targetSession) {
+            return await socket.sendMessage(sender, {
+                text: `❌ *${targetNumber}* mulinma bot eka pair karanna one!\n\n\`.pair ${targetNumber}\` use karanna, nathnam pairing web link eka eyata denna.`
+            }, { quoted: msg });
+        }
+
+        const targetConfig = await loadUserConfig(targetNumber);
+        const now = Date.now();
+        const currentExpiry = targetConfig.LICENSE_EXPIRY ? new Date(targetConfig.LICENSE_EXPIRY).getTime() : 0;
+        const baseTime = currentExpiry > now ? currentExpiry : now; // dan active nam eken passe extend karanawa
+        const newExpiry = new Date(baseTime);
+        newExpiry.setMonth(newExpiry.getMonth() + months);
+
+        const updatedConfig = { ...targetConfig, LICENSE_EXPIRY: newExpiry.toISOString() };
+        await updateUserConfig(targetNumber, updatedConfig);
+
+        // Meema process eke thamayi eyage bot eka active nam, live widihatama update karanawa
+        const liveEntry = activeSockets.get(targetNumber);
+        if (liveEntry) {
+            liveEntry.config = updatedConfig;
+            activeSockets.set(targetNumber, liveEntry);
+        }
+
+        await socket.sendMessage(sender, {
+            text: `✅ *Subscription Added!*\n\n📱 *Number:* ${targetNumber}\n📅 *Months:* ${months}\n⏳ *Expires:* ${newExpiry.toDateString()}`
+        }, { quoted: msg });
+
+        // Customer ta notify karanawa
+        try {
+            await socket.sendMessage(`${targetNumber}@s.whatsapp.net`, {
+                text: `🎉 *Subscription Activated!*\n\nOyage bot eka dan *active*! ✅\n\n⏳ *Expires:* ${newExpiry.toDateString()}\n\n_Bot eka dan free widihata use karanna puluwan._`
+            });
+        } catch (notifyErr) {
+            // number eka bot ekakma nam notify wenne nathi wenna puluwan, ok tibenna denna
+        }
+
+    } catch (err) {
+        console.error('.add command error:', err.message);
+        await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+// ==========================================
+// 🆕 SUBSCRIPTION STATUS (.license / .mysub)
+// ==========================================
+case 'license':
+case 'mysub':
+case 'subscription': {
+    const isMasterBotNumber = (config.OWNER_NUMBERS || []).includes(sanitizedNumber);
+    if (isMasterBotNumber) {
+        return await socket.sendMessage(sender, {
+            text: `👑 *Master Bot* - Subscription ekak one nah, permanent access.`
+        }, { quoted: msg });
+    }
+
+    const expiryStr = sessionConfig.LICENSE_EXPIRY;
+    if (!expiryStr) {
+        return await socket.sendMessage(sender, {
+            text: `⛔ *No Active Subscription*\n\nOwner ta contact karala subscribe karanna.\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
+        }, { quoted: msg });
+    }
+
+    const expiry = new Date(expiryStr);
+    const active = expiry.getTime() > Date.now();
+    const daysLeft = Math.ceil((expiry.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+
+    await socket.sendMessage(sender, {
+        text: `${active ? '✅' : '⛔'} *Subscription Status*\n\n📅 *Expires:* ${expiry.toDateString()}\n${active ? `🟢 *Active* (${daysLeft} days left)` : '🔴 *Expired*'}\n\n${!active ? `Renew karanna owner ta contact karanna: wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}` : ''}`
+    }, { quoted: msg });
     break;
 }
 // ==========================================
