@@ -9,7 +9,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "v7.0.0-rc14",
+    "chama-bailez-pro": "^3.3.2",
     "express": "^4.18.2",
     "mongoose": "^8.16.0",
     "axios": "^1.6.0",
