@@ -169,12 +169,14 @@ const downloadGdriveFile = async (url, dest) => {
 // ⭐ Direct download (non-GDrive)
 const downloadDirect = async (url, dest) => {
     await fs.ensureDir(path.dirname(dest));
-    const writer = fs.createWriteStream(dest);
+    const STALL_MS = 120000; // 2 min: data enne nathi unoth download eka nawaththanawa
+    const controller = new AbortController();
     const res = await axios({
         url,
         method: 'GET',
         responseType: 'stream',
-        timeout: 0,
+        timeout: 120000,          // connect / first byte ekata 2 min
+        signal: controller.signal,
         maxRedirects: 10,
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
@@ -190,12 +192,33 @@ const downloadDirect = async (url, dest) => {
         throw new Error('HTML response (not a file)');
     }
 
-    res.data.pipe(writer);
-    await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-        res.data.on('error', reject);
-    });
+    const writer = fs.createWriteStream(dest);
+    let stallTimer = null;
+    const armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+            controller.abort();
+            res.data.destroy(new Error('Download stalled (2 min data nathi)'));
+        }, STALL_MS);
+    };
+    armStall();
+    res.data.on('data', armStall);
+
+    try {
+        res.data.pipe(writer);
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+            res.data.on('error', reject);
+            res.data.on('aborted', () => reject(new Error('Download aborted')));
+        });
+    } catch (e) {
+        writer.destroy();
+        await fs.remove(dest).catch(() => {});
+        throw e;
+    } finally {
+        clearTimeout(stallTimer);
+    }
 
     const stats = await fs.stat(dest);
     if (stats.size < 1024 * 100) {
@@ -218,19 +241,389 @@ const downloadSmart = async (url, dest) => {
 
 console.log('✅ SHAGGY XMD Helpers loaded');
 
-import {
-    default as makeWASocket,
+// 🔁 Movie API slow/fail unoth ekaparak ayeth try karanawa (GET/HEAD witharai)
+axios.interceptors.response.use(undefined, async (err) => {
+    try {
+        const cfg = err.config;
+        if (!cfg || cfg.__retried) throw err;
+        const method = (cfg.method || 'get').toLowerCase();
+        if (method !== 'get' && method !== 'head') throw err;
+        const status = err.response?.status;
+        const transient = ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(err.code) || [429, 502, 503, 504].includes(status);
+        if (!transient) throw err;
+        cfg.__retried = true;
+        await new Promise(r => setTimeout(r, 2000));
+        return await axios(cfg);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+});
+
+
+// 🧩 Baileys engine: chama-bailez-pro (stock @whiskeysockets/baileys wenuwata)
+import * as BaileysNS from 'chama-bailez-pro';
+const BAILEYS_ACTIVE = 'chama-bailez-pro';
+console.log(`🧩 Baileys engine: ${BAILEYS_ACTIVE}`);
+const makeWASocket = BaileysNS.default?.default || BaileysNS.default || BaileysNS.makeWASocket;
+const {
     useMultiFileAuthState,
     delay,
     Browsers,
     fetchLatestBaileysVersion,
     downloadContentFromMessage,
-    jidNormalizedUser,
-    isPnUser
-} from '@whiskeysockets/baileys';
+    downloadMediaMessage,
+    jidNormalizedUser
+} = BaileysNS;
+// fork eke nathi unoth wada karana shim
+const isPnUser = BaileysNS.isPnUser || ((jid) => String(jid || '').endsWith('@s.whatsapp.net'));
+// ==========================================================
+// 🔘 BUTTON MODE ENGINE (inlined - separate file ekak one na)
+// ==========================================================
+const { installButtonMode, sendList, extractIncoming, isReplyTo, sameChat, unwrap } = (() => {
+const B = BaileysNS;
+// ==========================================================
+// 🔘 BUTTON MODE ENGINE
+// ----------------------------------------------------------
+// BUTTON_MODE = 'true'  -> numbered "reply a number" messages are sent as
+//                          tappable buttons / list menus automatically.
+// BUTTON_MODE = 'false' -> everything works the old way (reply with number).
+//
+// How it works (no command has to be rewritten):
+//  1. socket.sendMessage is wrapped. When button mode is ON and a text/image
+//     caption contains a numbered list (1, 2, 3 ...), it is sent as an
+//     interactive message (quick-reply buttons for <=3 items, list otherwise).
+//  2. When the user taps a button, we turn it into a normal "reply with number"
+//     message (same stanzaId) and re-emit it, so the existing reply listeners
+//     (menu, cineverse, cinesubz ...) work unchanged.
+//  3. If anything fails, the original plain message is sent (fail-safe).
+// ==========================================================
+
+const cut = (s, n) => {
+    s = String(s || '').replace(/\s+/g, ' ').trim();
+    return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s;
+};
+const num = (j) => String(j || '').split('@')[0].split(':')[0];
+const isGroupJid = (j) => String(j || '').endsWith('@g.us');
+const rid = () => 'BTNSYN' + Math.random().toString(36).slice(2, 12).toUpperCase();
+
+// Commands that can run straight from a menu button (no argument needed)
+const NO_ARG_CMDS = new Set([
+    'alive', 'menu', 'help', 'ping', 'owner', 'license', 'bots', 'getkey',
+    'groupinfo', 'jid', 'autorep', 'set', 'tagall', 'news', 'button'
+]);
+
+// ---------- incoming message helpers ----------
+
+function unwrap(message) {
+    let m = message || {};
+    for (let i = 0; i < 6; i++) {
+        const inner = m.ephemeralMessage?.message
+            || m.viewOnceMessage?.message
+            || m.viewOnceMessageV2?.message
+            || m.viewOnceMessageV2Extension?.message
+            || m.documentWithCaptionMessage?.message;
+        if (!inner) break;
+        m = inner;
+    }
+    return m;
+}
+
+/** Reads text / button id / quoted-message id from ANY message type. */
+function extractIncoming(mek) {
+    const m = unwrap(mek?.message);
+    let text = '', buttonId = '', ctx;
+    if (m.conversation) {
+        text = m.conversation;
+    } else if (m.extendedTextMessage) {
+        text = m.extendedTextMessage.text || '';
+        ctx = m.extendedTextMessage.contextInfo;
+    } else if (m.buttonsResponseMessage) {
+        buttonId = m.buttonsResponseMessage.selectedButtonId || '';
+        ctx = m.buttonsResponseMessage.contextInfo;
+    } else if (m.listResponseMessage) {
+        buttonId = m.listResponseMessage.singleSelectReply?.selectedRowId || '';
+        ctx = m.listResponseMessage.contextInfo;
+    } else if (m.templateButtonReplyMessage) {
+        buttonId = m.templateButtonReplyMessage.selectedId || '';
+        ctx = m.templateButtonReplyMessage.contextInfo;
+    } else if (m.interactiveResponseMessage) {
+        const r = m.interactiveResponseMessage;
+        try { buttonId = JSON.parse(r.nativeFlowResponseMessage?.paramsJson || '{}').id || ''; } catch { /* ignore */ }
+        ctx = r.contextInfo;
+    }
+    return { text: String(text).trim(), buttonId, stanzaId: ctx?.stanzaId, ctx };
+}
+
+/** Is this message in the same chat as `jid`? (ignores :device and lid/pn mix-ups) */
+function sameChat(key, jid) {
+    const t = num(jid);
+    return num(key?.remoteJid) === t || num(key?.remoteJidAlt) === t;
+}
+
+/**
+ * True when `mek` answers the bot message `botMsgId`.
+ * Accepts: a proper quoted reply, OR a bare number typed without quoting
+ * (only when it does not quote some other message).
+ */
+function isReplyTo(mek, botMsgId, { allowBareNumber = true } = {}) {
+    const { text, stanzaId } = extractIncoming(mek);
+    if (stanzaId) return stanzaId === botMsgId;
+    return allowBareNumber && /^\d{1,3}$/.test(text);
+}
+
+// ---------- numbered-list parser ----------
+
+const DESC_START = /^[↳└⤷➥⮡]/;
+
+function parseItems(raw) {
+    const items = [];
+    let expected = 1;
+    for (const rawLine of String(raw || '').split('\n')) {
+        // strip markdown + box characters
+        const line = rawLine.replace(/[*_~`]/g, '').replace(/[│┃║]/g, ' ').trim();
+        if (!line) continue;
+
+        if (DESC_START.test(line)) {
+            const last = items[items.length - 1];
+            if (last && !last.description) last.description = line.replace(DESC_START, '').trim();
+            continue;
+        }
+        const m = line.match(/^[^\p{L}\p{N}]*?(\d{1,3})(?:\uFE0F?\u20E3)?(?![\d%])(?!\.\d)\s*([.)\]:\-–—❭>»➜➤→]*)\s*(.*)$/u);
+        if (!m) continue;
+        if (parseInt(m[1], 10) !== expected) continue;
+
+        let title = m[3].replace(/^[\s.)\]:\-–—❭>»➜➤→┃|]+/, '').trim();
+        if (!title) title = `Option ${expected}`;
+        items.push({ n: expected, title, description: '' });
+        expected++;
+        if (items.length >= 100) break;
+    }
+    return items;
+}
+
+// ---------- interactive senders ----------
+
+const makeId = (socket) =>
+    (B.generateMessageIDV2 ? B.generateMessageIDV2(socket.user?.id) : B.generateMessageID());
+
+async function relayInteractive(socket, jid, { body, footer = '', image, buttons, quoted, msgId }) {
+    const IM = B.proto.Message.InteractiveMessage;
+
+    let header = IM.Header.create({ title: '', hasMediaAttachment: false });
+    if (image) {
+        try {
+            const media = await B.prepareWAMessageMedia({ image }, { upload: socket.waUploadToServer });
+            header = IM.Header.create({ title: '', hasMediaAttachment: true, imageMessage: media.imageMessage });
+        } catch (e) {
+            console.error('[ButtonMode] header image failed, sending without image:', e.message);
+        }
+    }
+
+    const interactive = IM.create({
+        body: IM.Body.create({ text: String(body).slice(0, 4000) }),
+        footer: footer ? IM.Footer.create({ text: cut(footer, 60) }) : undefined,
+        header,
+        nativeFlowMessage: IM.NativeFlowMessage.create({ buttons, messageParamsJson: '' })
+    });
+
+    if (quoted?.key && quoted.message) {
+        interactive.contextInfo = {
+            stanzaId: quoted.key.id,
+            participant: quoted.key.participant || quoted.key.remoteJid,
+            quotedMessage: quoted.message
+        };
+    }
+
+    const message = {
+        viewOnceMessage: {
+            message: {
+                messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
+                interactiveMessage: interactive
+            }
+        }
+    };
+
+    const additionalNodes = [{
+        tag: 'biz', attrs: {},
+        content: [{
+            tag: 'interactive', attrs: { type: 'native_flow', v: '1' },
+            content: [{ tag: 'native_flow', attrs: { v: '9', name: 'mixed' }, content: [] }]
+        }]
+    }];
+    if (!isGroupJid(jid)) additionalNodes.push({ tag: 'bot', attrs: { biz_bot: '1' } });
+
+    await socket.relayMessage(jid, message, { messageId: msgId, additionalNodes });
+    return { key: { remoteJid: jid, fromMe: true, id: msgId }, message, status: 1 };
+}
+
+const quickReply = (title, id) => ({
+    name: 'quick_reply',
+    buttonParamsJson: JSON.stringify({ display_text: cut(title, 20), id })
+});
+
+const singleSelect = (buttonText, sections) => ({
+    name: 'single_select',
+    buttonParamsJson: JSON.stringify({ title: cut(buttonText, 24), sections })
+});
+
+const chunkRows = (rows, size = 10) => {
+    const out = [];
+    for (let i = 0; i < rows.length; i += size) {
+        const part = rows.slice(i, i + size);
+        out.push({
+            title: rows.length > size ? `${i + 1} - ${i + part.length}` : 'Choose one',
+            highlight_label: '',
+            rows: part
+        });
+    }
+    return out;
+};
+
+/**
+ * Send a tappable list. Row ids may contain the placeholder {ID}, which is
+ * replaced with this message's own id (used for "back" rows).
+ * rows: [{ title, description, id }]
+ */
+async function sendList(socket, jid, { text, image, footer, buttonText = '📋 Select', rows, quoted }) {
+    const msgId = makeId(socket);
+    const fixed = rows.slice(0, 100).map((r) => ({
+        header: '',
+        title: cut(r.title, 24),
+        description: cut(r.description || '', 72),
+        id: String(r.id).replace('{ID}', msgId)
+    }));
+    return relayInteractive(socket, jid, {
+        body: text, footer, image, quoted, msgId,
+        buttons: [singleSelect(buttonText, chunkRows(fixed))]
+    });
+}
+
+// ---------- install ----------
+
+/**
+ * @param socket   baileys socket
+ * @param opts.isOn    () => boolean   live button-mode flag
+ * @param opts.prefix  () => string    live command prefix
+ */
+function installButtonMode(socket, { isOn, prefix }) {
+    if (socket.__buttonModeInstalled) return;
+    socket.__buttonModeInstalled = true;
+
+    const origSend = socket.sendMessage.bind(socket);
+
+    // ---- 1) outgoing: numbered lists -> buttons -------------------------
+    socket.sendMessage = async (jid, content, options) => {
+        try {
+            if (isOn() && content && typeof content === 'object'
+                && jid !== 'status@broadcast' && !String(jid).endsWith('@newsletter')) {
+                const converted = await tryConvert(jid, content, options);
+                if (converted) return converted;
+            }
+        } catch (e) {
+            console.error('[ButtonMode] fallback to plain message:', e.message);
+        }
+        return origSend(jid, content, options);
+    };
+
+    async function tryConvert(jid, content, options) {
+        const blocked = ['buttons', 'sections', 'templateButtons', 'interactiveMessage', 'react', 'delete',
+            'edit', 'forward', 'poll', 'contacts', 'location', 'document', 'video', 'audio', 'sticker'];
+        if (blocked.some((k) => content[k] !== undefined)) return null;
+
+        const isText = typeof content.text === 'string';
+        const isImage = content.image && typeof content.caption === 'string';
+        if (!isText && !isImage) return null;
+
+        const text = isText ? content.text : content.caption;
+        const items = parseItems(text);
+        if (items.length < 2) return null;
+
+        const msgId = makeId(socket);
+        const idFor = (n) => `BTN|NUM|${msgId}|${n}`;
+        let buttons;
+        if (items.length <= 3) {
+            buttons = items.map((it) => quickReply(`${it.n}. ${it.title}`, idFor(it.n)));
+        } else {
+            const rows = items.map((it) => ({
+                header: '',
+                title: cut(`${it.n}. ${it.title}`, 24),
+                description: cut(it.description || (it.title.length > 24 ? it.title : ''), 72),
+                id: idFor(it.n)
+            }));
+            buttons = [singleSelect('📋 Select', chunkRows(rows))];
+        }
+
+        return relayInteractive(socket, jid, {
+            body: text,
+            image: isImage ? content.image : undefined,
+            quoted: options?.quoted,
+            buttons,
+            msgId
+        });
+    }
+
+    // ---- 2) incoming: button taps -> synthetic normal messages -----------
+    socket.ev.on('messages.upsert', async ({ messages }) => {
+        for (const mek of messages || []) {
+            try {
+                if (!mek?.message || mek.__synthetic) continue; // fromMe allowed: bot number owner taps buttons on own account
+                const { buttonId } = extractIncoming(mek);
+                if (!buttonId || !buttonId.startsWith('BTN|')) continue;
+
+                const [, kind, a, b] = buttonId.split('|');
+                const base = {
+                    key: {
+                        remoteJid: mek.key.remoteJid,
+                        remoteJidAlt: mek.key.remoteJidAlt,
+                        participant: mek.key.participant,
+                        fromMe: !!mek.key.fromMe,
+                        id: rid()
+                    },
+                    pushName: mek.pushName,
+                    messageTimestamp: Math.floor(Date.now() / 1000),
+                    __synthetic: true
+                };
+                const emit = (message) =>
+                    socket.ev.emit('messages.upsert', { type: 'notify', messages: [{ ...base, message }] });
+
+                if (kind === 'NUM') {
+                    // tapped a numbered option -> behave like "reply with number"
+                    emit({
+                        extendedTextMessage: {
+                            text: String(b),
+                            contextInfo: {
+                                stanzaId: a,
+                                participant: socket.user?.id ? B.jidNormalizedUser(socket.user.id) : undefined,
+                                quotedMessage: { conversation: '' }
+                            }
+                        }
+                    });
+                } else if (kind === 'CMD') {
+                    const P = prefix();
+                    if (NO_ARG_CMDS.has(a)) {
+                        emit({ conversation: `${P}${a}` });
+                    } else {
+                        await origSend(mek.key.remoteJid, {
+                            text: `✍️ *${P}${a}* use karanna:\n\`${P}${a} <name>\`\n\n_Command eka type karala name eka dala send karanna._`
+                        }, { quoted: mek });
+                    }
+                } else if (kind === 'RUN') {
+                    emit({ conversation: buttonId.slice('BTN|RUN|'.length) });
+                }
+            } catch (e) {
+                console.error('[ButtonMode] tap handler error:', e.message);
+            }
+        }
+    });
+
+    console.log('🔘 Button mode engine installed');
+}
+
+return { installButtonMode, sendList, extractIncoming, isReplyTo, sameChat, unwrap };
+})();
 
 export const router = express.Router();
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+if (process.env.ALLOW_INSECURE_TLS === 'true') process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const insecureAgent = new https.Agent({
     rejectUnauthorized: false
@@ -240,19 +633,20 @@ const config = {
     AUTO_TYPING: 'false',
     AUTO_REACT: 'false',
     READ_CMD: 'false',
+    BUTTON_MODE: 'false',
     API_MAIN_URL: 'https://zara.laksidu.site',
     API_MAIN_URL2:'https://zara.laksidu.site',
     API_CINESUBZ_URL:'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_MOVIE_URL: 'https://api-siteh-22e22e4cb068.herokuapp.com',
     API_KEY:'lakiya_2f3b6c382d1236ad7a08d56331fb679935d51dfc846df2c254093fd1fff9494e',
     BOT_IMAGE:'https://files.catbox.moe/wogma6.jpeg',
-    BOT_FOOTER:"SHAGGY XMD 〽️ᴏᴠɪᴇ Bᴏᴛ ᴠ3",
+    BOT_FOOTER:"SHAGGY XMD 〽️ᴏᴠɪᴇ Bᴏᴛ ᴠ4",
     MGROUP_LINK: 'https://chat.whatsapp.com/EeMhcQufXDFABM1MnR05Wh?s=cl&p=a&mlu=4&ilr=4',
     MOVIE_FOOTER:"⏤͟͟͞͞★❮ SHAGGY XMD 〽️OVIE ⏤͟͟͞͞★",
     MOVIE_CAPTION:"🇸‌ʜᴀɢɢY-xᴍᴅ ᴍᴏᴠɪᴇ 🔥🌈",
     PREFIX: '.',
     OWNER_NUMBERS: ['94784224161'],   // 🆕 ඔයාගේ number එක දාන්න
-    BOT_NAME: "TEST-BOT",
+    BOT_NAME: "SHAGGY XMD",
     AIR_FOOTER: "ꜱʜᴀɢɢY-xᴍᴅ ᴠ2⚡",
     MODE: 'public',
     MAX_RETRIES: 3
@@ -260,10 +654,12 @@ const config = {
 const activeSockets = new Map();
 // 🆕 Interval/Stream tracking - number ekakata interval/stream ekakma witharak thiyenna one (reconnect wela stack wenna epa)
 const configSyncIntervals = new Map();
+const configPushers = new Map(); // number -> (newConfig) => live bot ekata ikmanata apply karanawa
 const configSyncStreams = new Map();
 const presenceIntervals = new Map();
 
 function clearNumberIntervals(sanitizedNumber) {
+    configPushers.delete(sanitizedNumber);
     if (configSyncIntervals.has(sanitizedNumber)) {
         clearInterval(configSyncIntervals.get(sanitizedNumber));
         configSyncIntervals.delete(sanitizedNumber);
@@ -302,6 +698,20 @@ async function loadAutoReplyCache(sanitizedNumber) {
 const messageCache = new Map(); // key: `${remoteJid}:${msgId}` -> { text, senderNumber, timestamp }
 const MESSAGE_CACHE_LIMIT = 500;
 
+const rawCache = new Map(); // `${jid}:${id}` -> { msg, ... }  (media / text okkoma)
+function cacheRaw(msg) {
+    rawCache.set(`${msg.key.remoteJid}:${msg.key.id}`, {
+        msg,
+        pushName: msg.pushName,
+        remoteJid: msg.key.remoteJid,
+        remoteJidAlt: msg.key.remoteJidAlt,
+        participant: msg.key.participant,
+        participantAlt: msg.key.participantAlt,
+        ts: Date.now()
+    });
+    if (rawCache.size > 800) rawCache.delete(rawCache.keys().next().value);
+}
+
 function cacheMessage(remoteJid, msgId, data) {
     const key = `${remoteJid}:${msgId}`;
     messageCache.set(key, { ...data, timestamp: Date.now() });
@@ -325,6 +735,14 @@ const SessionSchema = new mongoose.Schema({
 });
 const Session = mongoose.model('Session', SessionSchema);
 
+// 🎫 Subscription licenses: customer pair karanna kalinuth .add karanna puluwan
+const LicenseSchema = new mongoose.Schema({
+    number: { type: String, unique: true, required: true },
+    expiry: { type: Date, required: true },
+    updatedAt: { type: Date, default: Date.now }
+});
+const License = mongoose.model('License', LicenseSchema);
+
 // 🆕 Auto Reply Schema (number ekakata scope wela, image ekath support karanawa)
 const AutoReplySchema = new mongoose.Schema({
     number: { type: String, required: true, index: true },
@@ -339,10 +757,7 @@ const AutoReply = mongoose.model('AutoReply', AutoReplySchema);
 async function connectMongoDB() {
     try {
         const mongoUri = process.env.MONGO_URI;
-        await mongoose.connect(mongoUri, {
-            useNewUrlParser: true,
-            useUnifiedTopology: true
-        });
+        await mongoose.connect(mongoUri);
         console.log(`
 ╔══════════════════════════════════════╗
 ║  ✅ MongoDB Connected Successfully   ║
@@ -409,8 +824,179 @@ async function autoReconnectOnStartup() {
 initialize();
 setTimeout(autoReconnectOnStartup, 5000);
 
+// 🖼️ Bot images (menu eka witharak wenama image ekak use karanawa - menuImage)
+const BOT_IMAGES = [
+    'https://cloud.laksidu.site/stream/coNOXYjWqD/IMG-20260929-WA1350.jpg',
+    'https://cloud.laksidu.site/stream/w2M1YwqSMp/IMG-20260929-WA7000.jpg',
+    'https://cloud.laksidu.site/stream/aHdIQEq804/IMG-20260929-WA4539.jpg',
+    'https://cloud.laksidu.site/stream/LWsBZ1wzUC/IMG-20260929-WA0563.jpg',
+    'https://cloud.laksidu.site/stream/AjvgPH44oY/IMG-20260929-WA8438.jpg'
+];
+function pickBotImage(sc) {
+    const custom = sc && sc.BOT_IMAGE;
+    if (custom && custom !== config.BOT_IMAGE) return custom; // .set BOT_IMAGE kala nam eka
+    return BOT_IMAGES[Math.floor(Math.random() * BOT_IMAGES.length)];
+}
+
+// ==========================================================
+// 🎬 CineSubz download helpers (laksidu API 500 dunnoth chamindu API ekata fallback wenawa)
+// ==========================================================
+
+// 👥 Group ekata movie/file yawana helpers
+async function resolveTargetGroup(socket, linkInput) {
+    const code = linkInput.includes('chat.whatsapp.com/') ? linkInput.split('chat.whatsapp.com/')[1].split(/[?\s]/)[0].trim() : linkInput.trim();
+    const info = await socket.groupGetInviteInfo(code);
+    const jid = info.id;
+    try {
+        await socket.groupMetadata(jid);            // bot eka e group eke inna nam
+    } catch {
+        await socket.groupAcceptInvite(code);        // nathnam link eken join wenawa
+        await new Promise(r => setTimeout(r, 3000));
+        await socket.groupMetadata(jid);
+    }
+    return { jid, name: info.subject || 'Group' };
+}
+
+// direct URL send fail unoth: file eka mulin download karala stream ekak widihata yawanawa
+async function sendToGroupWithFallback(socket, jid, content) {
+    try {
+        return await socket.sendMessage(jid, content);
+    } catch (e1) {
+        const url = content?.document?.url;
+        if (!url || !/^https?:\/\//i.test(url)) throw e1;
+        console.error('[groupsend] direct url send failed, downloading first:', e1.message);
+        const tmp = `/tmp/gs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.bin`;
+        try {
+            await downloadDirect(url, tmp);
+            return await socket.sendMessage(jid, { ...content, document: { stream: fs.createReadStream(tmp) } });
+        } finally {
+            await fs.remove(tmp).catch(() => {});
+        }
+    }
+}
+
+const voteInviteCache = new Map();
+const votePollCache = new Map();
+const CINE_FB_BASE = 'https://api.chamindu.site';
+const CINE_FB_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
+const cineNorm = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+async function cineGetWithRetry(url) {
+    try {
+        return await axios.get(url, { timeout: 120000 });
+    } catch (e) {
+        const st = e.response?.status;
+        if (!st || st >= 500) { // server error / network -> ekaparak ayeth try
+            await new Promise(r => setTimeout(r, 3000));
+            return await axios.get(url, { timeout: 120000 });
+        }
+        throw e;
+    }
+}
+
+async function cineFallbackMovieLink(movieUrl, quality, index) {
+    const r = await axios.get(`${CINE_FB_BASE}/api/v1/movie/cinesubz/infodl?q=${encodeURIComponent(movieUrl)}&api_key=${CINE_FB_KEY}`, { timeout: 120000 });
+    const dls = r.data?.data?.downloads || [];
+    if (!r.data?.status || dls.length === 0) throw new Error('Fallback API eken download links hamu una na');
+    const hit = dls.find(d => cineNorm(d.quality) === cineNorm(quality)) || dls[index] || dls[0];
+    if (!hit?.link) throw new Error('Fallback API eken link eka na');
+    return { url: hit.link, quality: hit.quality };
+}
+
+async function cineFallbackEpisodeLink(showUrl, epList, selectedEpisode) {
+    const info = await axios.get(`${CINE_FB_BASE}/api/v1/movie/cinesubz/tv/info?q=${encodeURIComponent(showUrl)}&api_key=${CINE_FB_KEY}`, { timeout: 120000 });
+    const eps = info.data?.data?.episodes || [];
+    if (!info.data?.status || eps.length === 0) throw new Error('Fallback API eken episodes hamu una na');
+    let ep = eps.find(e => cineNorm(e.episode_name) && cineNorm(e.episode_name) === cineNorm(selectedEpisode.title));
+    if (!ep) {
+        const idx = (epList || []).findIndex(e => e.url === selectedEpisode.url);
+        if (idx > -1 && eps[idx]) ep = eps[idx];
+    }
+    if (!ep) throw new Error('Fallback API eken e episode eka hamu una na');
+    const dl = await axios.get(`${CINE_FB_BASE}/api/v1/movie/cinesubz/tv/dl?q=${encodeURIComponent(ep.episode_url)}&api_key=${CINE_FB_KEY}`, { timeout: 120000 });
+    const arr = dl.data?.data || [];
+    if (!dl.data?.status || arr.length === 0) throw new Error('Fallback API eken episode link eka na');
+    const nonT = arr.filter(l => l.link && !l.link.includes('t.me') && !l.link.includes('telegram'));
+    return { url: (nonT[0] || arr[0]).link };
+}
+
+// 📢 Baileys 7.0.0-rc14 bug: channel (newsletter) media wala upload path eka waradi (/mms/...), eka nisa WhatsApp eken ack 479 dena.
+// Sahi path eka (/newsletter/newsletter-<type>) + server_thumb_gen=1 use karana upload function ekak.
+const NEWSLETTER_UPLOAD_PATHS = {
+    image: '/newsletter/newsletter-image',
+    video: '/newsletter/newsletter-video',
+    audio: '/newsletter/newsletter-audio',
+    document: '/newsletter/newsletter-document',
+    sticker: '/newsletter/newsletter-image'
+};
+
+async function getMediaConnFor(socket) {
+    if (typeof socket.refreshMediaConn === 'function') return await socket.refreshMediaConn(false);
+    // fallback: media_conn IQ eka ekama hadagannawa
+    const result = await socket.query({ tag: 'iq', attrs: { type: 'set', xmlns: 'w:m', to: '@s.whatsapp.net' }, content: [{ tag: 'media_conn', attrs: {} }] });
+    const node = BaileysNS.getBinaryNodeChild(result, 'media_conn');
+    return {
+        auth: node.attrs.auth,
+        hosts: BaileysNS.getBinaryNodeChildren(node, 'host').map(h => ({ hostname: h.attrs.hostname }))
+    };
+}
+
+function makeNewsletterUpload(socket) {
+    return async (filePath, { mediaType, fileEncSha256B64, timeoutMs } = {}) => {
+        const info = await getMediaConnFor(socket);
+        if (!info?.auth || !info?.hosts?.length) throw new Error('Media upload server details ganna baha una');
+        const token = encodeURIComponent(String(fileEncSha256B64).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''));
+        const path = NEWSLETTER_UPLOAD_PATHS[mediaType] || `/newsletter/newsletter-${mediaType}`;
+        let lastErr = null;
+        for (const { hostname } of info.hosts) {
+            try {
+                const url = `https://${hostname}${path}/${token}?auth=${encodeURIComponent(info.auth)}&token=${token}&server_thumb_gen=1`;
+                const res = await axios.post(url, fs.createReadStream(filePath), {
+                    headers: { 'Content-Type': 'application/octet-stream', Origin: 'https://web.whatsapp.com' },
+                    timeout: timeoutMs || 120000,
+                    maxBodyLength: Infinity,
+                    maxContentLength: Infinity,
+                    responseType: 'json'
+                });
+                const d = res.data;
+                if (d?.url || d?.direct_path) return { mediaUrl: d.url, directPath: d.direct_path };
+                lastErr = new Error('Upload response eke url eka na');
+            } catch (e) {
+                lastErr = e;
+            }
+        }
+        throw lastErr || new Error('Channel media upload fail una');
+    };
+}
+
+// 📢 Channel ekata yawala WhatsApp eken reject kalada balanawa (ack error) - "yawwa" kiyala hariyata kiyanna
+async function sendToChannelChecked(socket, jid, content, { custom = true, waitMs = 15000 } = {}) {
+    const id = BaileysNS.generateMessageIDV2 ? BaileysNS.generateMessageIDV2(socket.user?.id) : BaileysNS.generateMessageID();
+    let ackNode = null;
+    let resolveAck;
+    const ackP = new Promise(r => { resolveAck = r; });
+    const onAck = (node) => { ackNode = node; resolveAck(node); };
+    try { socket.ws.on('TAG:' + id, onAck); } catch { /* ignore */ }
+    const isMedia = ['image', 'video', 'audio', 'document', 'sticker'].some(k => content && content[k] !== undefined);
+    const opts = { messageId: id };
+    if (isMedia && custom) opts.upload = makeNewsletterUpload(socket); // sahi channel upload path eka
+    try {
+        await socket.sendMessage(jid, content, opts);
+        // ack eka enakan inna (error / ok). Ack eka awoth kalin iwara wenawa.
+        await Promise.race([ackP, new Promise(r => setTimeout(r, waitMs))]);
+    } finally {
+        try { socket.ws.off('TAG:' + id, onAck); } catch { /* ignore */ }
+    }
+    const ackErr = ackNode?.attrs?.error;
+    if (ackErr) {
+        const adminHint = ['401', '403'].includes(String(ackErr)) ? ' Bot number eka channel eke admin/owner nemei wage.' : '';
+        throw new Error(`WhatsApp channel post eka reject kala (code ${ackErr}).${adminHint}`);
+    }
+    return { confirmed: !!ackNode };
+}
+
 function formatMessage(title, content, footer) {
-    return `*${title}*\n\n${content}\n\n> *${footer}*`;
+    return `╭━━━━━━━━━━━━━━━━━━━╮\n┃ ✨ *${title}* ✨\n╰━━━━━━━━━━━━━━━━━━━╯\n\n${content}\n\n━━━━━━━━━━━━━━━━━━━\n> 🎭 *${footer}* 🎭`;
 }
 
 function getSriLankaTimestamp() {
@@ -520,6 +1106,19 @@ async function setupCommandHandlers(socket, number) {
     let sessionConfig = await loadUserConfig(sanitizedNumber);
     activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
 
+    // 🔘 Button mode engine (BUTTON_MODE=true nam numbered lists buttons wenawa)
+    // 🔒 Button mode: master (94784224161) + .add eken subscription dunna numbers walata witharai
+    const buttonAllowed = () => {
+        if ((config.OWNER_NUMBERS || []).includes(sanitizedNumber)) return true;
+        const exp = sessionConfig.LICENSE_EXPIRY ? new Date(sessionConfig.LICENSE_EXPIRY).getTime() : 0;
+        return exp > Date.now();
+    };
+    const buttonLockedMsg = `🔒 *Payment Required!*\n\n_Button mode (mulu bot ekama) paid feature ekak. *Pay karala subscription ekak* ganna._\n\n💳 *Pay karala ganna owner ta contact karanna:*\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`;
+    installButtonMode(socket, {
+        isOn: () => sessionConfig.BUTTON_MODE === 'true' && buttonAllowed(),
+        prefix: () => sessionConfig.PREFIX || config.PREFIX || '.'
+    });
+
     // 🆕 Web panel eken / wenath tenakin DB eke config eka wenas kalath, MongoDB Change Stream eken
     // (polling nathuwa) real-time widihata bot ekatama apply karanawa. Meka DB ekata continuous load
     // ekak dammema (poll karanne nathuwa) - change ekak welavakama witharak fire wenne.
@@ -527,47 +1126,36 @@ async function setupCommandHandlers(socket, number) {
     // alut ekak stack wela bot eka slow wena eka nawaththanna
     clearNumberIntervals(sanitizedNumber);
 
-    try {
-        const changeStream = Session.watch(
-            [{ $match: { 'fullDocument.number': sanitizedNumber } }],
-            { fullDocument: 'updateLookup' }
-        );
-        changeStream.on('change', (change) => {
-            try {
-                if (change.fullDocument && change.fullDocument.number === sanitizedNumber) {
-                    sessionConfig = { ...config, ...change.fullDocument.config };
-                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
-                    console.log(`🔄 Config live-synced (change stream) for ${sanitizedNumber}`);
-                }
-            } catch (applyErr) {
-                console.error(`Change stream apply error for ${sanitizedNumber}:`, applyErr.message);
+    // 🔄 Config sync: minutes 5kata ekaparak DB eke config eka balala, wenas unoth witharai bot ekata apply karanawa.
+    //  - number ekakata timer ekak witharai (clearNumberIntervals eken kalin eka ain karanawa) => stack wenne na
+    //  - kalin run eka iwara wenakan next run eka patan ganne na (syncBusy) => overlap / loop nathi
+    //  - .set / .add eken wenas kala hama welawema ikmanata apply wenawa; meka DB eke wenas kirim walata
+    const CONFIG_SYNC_MS = 5 * 60 * 1000;
+    const stableCfg = (o) => JSON.stringify(o || {}, Object.keys(o || {}).sort());
+    let syncBusy = false;
+    const configSyncTimer = setInterval(async () => {
+        if (syncBusy) return;
+        syncBusy = true;
+        try {
+            const fresh = await loadUserConfig(sanitizedNumber);
+            if (stableCfg(fresh) !== stableCfg(sessionConfig)) {
+                sessionConfig = fresh;
+                activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                console.log(`🔄 Config synced (5 min) for ${sanitizedNumber}`);
             }
-        });
-        changeStream.on('error', (err) => {
-            console.error(`Change stream error for ${sanitizedNumber}:`, err.message);
-        });
-        configSyncStreams.set(sanitizedNumber, changeStream);
-    } catch (streamErr) {
-        // 🆕 Change Streams support wenne nathi MongoDB ekak nam (standalone, replica set nathi), polling walata
-        // fallback wenawa - eth load eka adu karanna 15 seconds ekakata (3s nemei) dammee
-        console.error(`Change stream unavailable for ${sanitizedNumber}, falling back to polling:`, streamErr.message);
-        let lastConfigSnapshot = JSON.stringify(sessionConfig);
-        const configSyncInterval = setInterval(async () => {
-            try {
-                const freshConfig = await loadUserConfig(sanitizedNumber);
-                const freshSnapshot = JSON.stringify(freshConfig);
-                if (freshSnapshot !== lastConfigSnapshot) {
-                    sessionConfig = freshConfig;
-                    lastConfigSnapshot = freshSnapshot;
-                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
-                    console.log(`🔄 Config auto-synced (polling fallback) for ${sanitizedNumber}`);
-                }
-            } catch (syncErr) {
-                // ignore - DB eke temporary issue ekak wenna puluwan
-            }
-        }, 15000);
-        configSyncIntervals.set(sanitizedNumber, configSyncInterval);
-    }
+        } catch (syncErr) {
+            // DB temporary issue - next tick ekedi ayeth try karanawa
+        } finally {
+            syncBusy = false;
+        }
+    }, CONFIG_SYNC_MS);
+    if (configSyncTimer.unref) configSyncTimer.unref();
+    configSyncIntervals.set(sanitizedNumber, configSyncTimer);
+    // .add wage commands walata: bot eka run wenawa nam ikmanata config eka update karanna
+    configPushers.set(sanitizedNumber, (newCfg) => {
+        sessionConfig = newCfg;
+        activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+    });
 
     // Socket eka close/logout unama stream/interval eka clear karanawa (memory leak walakwanna)
     socket.ev.on('connection.update', (update) => {
@@ -599,20 +1187,62 @@ async function setupCommandHandlers(socket, number) {
             return;
         }
 
-        // 🆕 ANTI-DELETE: kawruth message ekak delete kalada balala, thiyenawa nam ownerta yawanawa
+        // 🆕 ANTI-DELETE: delete kale kawuda / eka yawwe kawuda kiyala penawa
         if (msg.message.protocolMessage && (msg.message.protocolMessage.type === 0 || msg.message.protocolMessage.type === 'REVOKE')) {
             try {
-                if (sessionConfig.ANTI_DELETE === 'true') {
-                    const revokedJid = msg.key.remoteJid;
+                if (sessionConfig.ANTI_DELETE === 'true' && !msg.key.fromMe) {
+                    const chatJid = msg.key.remoteJid;
                     const deletedId = msg.message.protocolMessage.key?.id;
-                    const cacheKey = `${revokedJid}:${deletedId}`;
-                    const cached = messageCache.get(cacheKey);
-                    if (cached && cached.text) {
+                    const ck = `${chatJid}:${deletedId}`;
+                    const raw = rawCache.get(ck);
+                    const cachedTxt = messageCache.get(ck);
+                    if (raw || cachedTxt) {
+                        const numOf = (j) => String(j || '').split('@')[0].split(':')[0];
+                        const pn = (j, alt) => (alt && String(alt).endsWith('@s.whatsapp.net')) ? numOf(alt) : numOf(j);
+                        const isGrp = chatJid.endsWith('@g.us');
+
+                        const sentBy = raw
+                            ? (isGrp ? pn(raw.participant, raw.participantAlt) : pn(raw.remoteJid, raw.remoteJidAlt))
+                            : (cachedTxt?.senderNumber || 'unknown');
+                        const deletedBy = isGrp
+                            ? pn(msg.key.participant, msg.key.participantAlt)
+                            : pn(chatJid, msg.key.remoteJidAlt);
+
+                        let chatName = 'Private Chat';
+                        if (isGrp) {
+                            try { chatName = (await socket.groupMetadata(chatJid)).subject || 'Group'; } catch { chatName = 'Group'; }
+                        }
+
+                        const inner = raw ? unwrap(raw.msg.message) : {};
+                        const typeKey = Object.keys(inner).find(k => k !== 'messageContextInfo') || 'text';
+                        const typeName = typeKey.replace('Message', '').replace('extendedText', 'text').replace('conversation', 'text');
+                        const body = cachedTxt?.text
+                            || inner.conversation || inner.extendedTextMessage?.text
+                            || inner.imageMessage?.caption || inner.videoMessage?.caption || '';
+
                         const ownerJid = jidNormalizedUser(socket.user.id);
                         await socket.sendMessage(ownerJid, {
-                            text: `🗑️ *Deleted Message Recovered*\n\n👤 *From:* ${cached.senderNumber}\n💬 *Chat:* ${revokedJid}\n\n📩 *Message:*\n${cached.text}`
+                            text:
+`╭━━━〔 🗑️ *𝗔𝗡𝗧𝗜 𝗗𝗘𝗟𝗘𝗧𝗘* 🗑️ 〕━━━╮
+┃
+┃ 🚫 *Deleted By :* wa.me/${deletedBy}
+┃ 📤 *Sent By    :* wa.me/${sentBy}${raw?.pushName ? ` (${raw.pushName})` : ''}
+┃ 💬 *Chat       :* ${chatName}
+┃ 📎 *Type       :* ${typeName}
+┃ 🕒 *Time       :* ${getSriLankaTimestamp()}
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯${body ? `\n\n📩 *Message:*\n${body}` : ''}
+
+> 🎭 *SHAGGY XMD* 🎭`
                         });
-                        messageCache.delete(cacheKey);
+
+                        // media nam original eka forward karanawa
+                        if (raw && typeName !== 'text' && typeName !== 'protocol') {
+                            try { await socket.sendMessage(ownerJid, { forward: raw.msg }); }
+                            catch (fwdErr) { console.error('AntiDelete forward failed:', fwdErr.message); }
+                        }
+                        messageCache.delete(ck);
+                        rawCache.delete(ck);
                     }
                 }
             } catch (adErr) {
@@ -620,6 +1250,11 @@ async function setupCommandHandlers(socket, number) {
             }
             return;
         }
+
+        // 🆕 anti-delete: hama message ekakma (media ekath) cache karanawa
+        try {
+            if (!msg.key.fromMe && msg.message && !msg.message.protocolMessage) cacheRaw(msg);
+        } catch { /* ignore */ }
 
         let text = '';
         if (msg.message.conversation) {
@@ -659,7 +1294,7 @@ async function setupCommandHandlers(socket, number) {
             const isLicensed = expiryTime > Date.now();
             if (!isLicensed && isCmd) {
                 await socket.sendMessage(sender, {
-                    text: `⛔ *Subscription Expired!*\n\n_Mee bot eka use karanna active subscription ekak nathi/ivara wela._\n\n💳 *Subscribe karanna owner ta contact karanna:*\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
+                    text: `⛔ *Payment Required!*\n\n_Mee bot eka paid bot ekak. Use karanna nam *pay karala subscription ekak* ganna one (subscription nathi / ivara wela)._\n\n💳 *Pay karala ganna owner ta contact karanna:*\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
                 }, { quoted: msg });
                 return;
             }
@@ -704,8 +1339,130 @@ async function setupCommandHandlers(socket, number) {
         try {
             switch (command) {
                 // ✅ ඔයාගේ cases ටික මෙතනට එනවා
+            case 'csong': {
+                // .csong <channel link>, <song name>  -> song eka channel ekata post karanawa (owner witharai)
+                if (!isOwner) {
+                    return await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg });
+                }
+                const csRaw = args.join(' ');
+                const csComma = csRaw.indexOf(',');
+                if (csComma === -1 || !csRaw.slice(0, csComma).trim() || !csRaw.slice(csComma + 1).trim()) {
+                    return await socket.sendMessage(sender, {
+                        text: `❌ *Use karana widiya:*\n\n\`${sessionConfig.PREFIX || '.'}csong <channel link>, <song name>\`\n\n*Example:*\n${sessionConfig.PREFIX || '.'}csong https://whatsapp.com/channel/0029VaXXXXXXX, Lelena\n\n_Bot number eka channel eke admin/owner wela inna one._`
+                    }, { quoted: msg });
+                }
+                const csLink = csRaw.slice(0, csComma).trim();
+                const csQuery = csRaw.slice(csComma + 1).trim();
+
+                try {
+                    await socket.sendMessage(sender, { react: { text: '🔎', key: msg.key } });
+
+                    // 1) channel eka hoyaganna
+                    let channelJid = null, channelName = 'Channel';
+                    if (/@newsletter$/.test(csLink)) {
+                        channelJid = csLink;
+                    } else {
+                        const codeM = csLink.match(/channel\/([A-Za-z0-9_-]+)/);
+                        if (!codeM) throw new Error('Channel link eka waradi (whatsapp.com/channel/... link ekak denna)');
+                        const meta = await socket.newsletterMetadata('invite', codeM[1]);
+                        if (!meta?.id) throw new Error('Channel eka hoyaganna baha');
+                        channelJid = meta.id;
+                        channelName = meta.name || meta.thread_metadata?.name?.text || 'Channel';
+                        const roleRaw = String(meta.viewer_metadata?.role || meta.role || meta.viewer?.role || '').toUpperCase();
+                        if (roleRaw && !['OWNER', 'ADMIN'].includes(roleRaw)) {
+                            throw new Error(`Bot number eka meka channel eke ${roleRaw} kenek. Post karanna nam *admin / owner* wenna one (channel eke Admins wala bot number eka add karanna).`);
+                        }
+                    }
+
+                    // 2) song eka hoyaganna
+                    const csRes = await yts(csQuery);
+                    const song = csRes.videos?.[0];
+                    if (!song) throw new Error(`"${csQuery}" kiyana song eka hamu una na`);
+
+                    await socket.sendMessage(sender, { text: `⏳ *${song.title}*\n_Download karala ${channelName} ekata post karanawa..._` }, { quoted: msg });
+
+                    // 3) mp3 download link eka
+                    const csApi = `${config.API_MAIN_URL}/api/ytmp3?url=https://youtu.be/${song.videoId}&api_key=${config.API_KEY}`;
+                    const csDl = await axios.get(csApi, { timeout: 120000 });
+                    if (csDl.data?.status !== 'success') throw new Error(csDl.data?.message || 'Song API error');
+                    const mp3Url = csDl.data.data.download_url;
+                    const songTitle = csDl.data.data.title || song.title;
+                    const thumb = csDl.data.data.thumbnail || song.thumbnail;
+
+                    const audioBuf = Buffer.from((await axios.get(mp3Url, { responseType: 'arraybuffer', timeout: 120000, maxContentLength: Infinity })).data);
+                    if (audioBuf.length < 50 * 1024) throw new Error('Song file eka waradi (godak podi)');
+
+                    // 4) lassana description ekak ekka channel ekata post
+                    const caption =
+`╭━━━〔 🎧 *𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗠𝗨𝗦𝗜𝗖* 🎧 〕━━━╮
+┃
+┃ 🎵 *Title*     : _${songTitle}_
+┃ 🎤 *Artist*    : _${song.author?.name || 'N/A'}_
+┃ ⏱️ *Duration*  : _${song.timestamp || 'N/A'}_
+┃ 👀 *Views*     : _${song.views?.toLocaleString() || 'N/A'}_
+┃ 📅 *Published* : _${song.ago || 'N/A'}_
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+🎶 _Headphones dala rasa wind wenna_ 🎧
+👇 *Song eka pahala thiyenawa* 👇
+
+❤️ *React karanna* | 🔁 *Share karanna*
+
+> 🎭 *𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗* 🎭`;
+
+                    // step-by-step: eka step ekak reject unath anith ewa yanawa; kohe fail unada penawa
+                    const stepLog = [];
+                    const tryStep = async (label, content, custom = true) => {
+                        try {
+                            const r = await sendToChannelChecked(socket, channelJid, content, { custom });
+                            stepLog.push(`${r.confirmed ? '✅' : '🟡'} ${label}${r.confirmed ? '' : ' (WhatsApp confirm kale na)'}`);
+                            return true;
+                        } catch (stepErr) {
+                            console.error(`[csong] ${label} failed:`, stepErr.message);
+                            const code = (stepErr.message.match(/code (\d+)/) || [])[1];
+                            stepLog.push(`❌ ${label}${code ? ` (code ${code})` : `: ${stepErr.message.slice(0, 50)}`}`);
+                            return false;
+                        }
+                    };
+
+                    // 1) description: image (custom upload) -> image (native upload) -> text
+                    let descOk = await tryStep('Description (image)', { image: { url: thumb }, caption });
+                    if (!descOk) descOk = await tryStep('Description (image, native)', { image: { url: thumb }, caption }, false);
+                    if (!descOk) descOk = await tryStep('Description (text)', { text: caption });
+
+                    // 2) mp3: audio file -> voice (ptt) -> document. Hama ekakama custom + native upload deka try karanawa
+                    const audioTries = [
+                        ['MP3 (audio)', { audio: audioBuf, mimetype: 'audio/mpeg', ptt: false }],
+                        ['MP3 (voice)', { audio: audioBuf, mimetype: 'audio/mpeg', ptt: true }],
+                        ['MP3 (file)', { document: audioBuf, mimetype: 'audio/mpeg', fileName: `${songTitle}.mp3` }]
+                    ];
+                    let audioOk = false;
+                    for (const [label, content] of audioTries) {
+                        audioOk = await tryStep(label, content);
+                        if (!audioOk) audioOk = await tryStep(`${label}, native`, content, false);
+                        if (audioOk) break;
+                    }
+
+                    if (!descOk && !audioOk) {
+                        throw new Error(`Channel eka kisima post ekak accept kale na.\n\n${stepLog.join('\n')}`);
+                    }
+
+                    await socket.sendMessage(sender, { react: { text: descOk && audioOk ? '✅' : '⚠️', key: msg.key } });
+                    await socket.sendMessage(sender, {
+                        text: `${descOk && audioOk ? '✅ *Channel ekata post kala!*' : '⚠️ *Podi issues ekka post kala*'}\n\n🎵 ${songTitle}\n📢 ${channelName}\n\n${stepLog.join('\n')}`
+                    }, { quoted: msg });
+                } catch (csErr) {
+                    console.error('[csong] error:', csErr.message);
+                    await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } }).catch(() => {});
+                    let hint = '';
+                    if (/code (401|403)\b/.test(csErr.message) && !/admin/i.test(csErr.message)) hint = '\n\n_Bot number eka meka channel eke admin/owner nemei wage._';
+                    await socket.sendMessage(sender, { text: `❌ *CSONG Error:* ${csErr.message}${hint}` }, { quoted: msg });
+                }
+                break;
+            }
+
             case 'song':
-            case 'csong':
     if (!args.length) {
         await socket.sendMessage(sender, {
             text: '❌ ERROR\n\n*Need YouTube URL or Song Title*'
@@ -972,7 +1729,7 @@ Failed to process TikTok request: ${error.message}`
 case 'cinesubz':
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image:  { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ හෝ TV series එකේ නම ලබාදෙන්න! උදා: .cinesubz batman*',
@@ -991,7 +1748,7 @@ case 'cinesubz':
 
         if (!searchData.status || !searchData.results || searchData.results.length === 0) {
             await socket.sendMessage(sender, {
-                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image:  { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*cinesubz හි චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
@@ -1038,7 +1795,7 @@ case 'cinesubz':
                 const choice = parseInt(messageType) - 1;
                 if (isNaN(choice) || choice < 0 || choice >= cinezubResults.length) {
                     await socket.sendMessage(sender, {
-                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image:  { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ INVALID SELECTION',
                             `*වැරදි අංකයක්! 1-${cinezubResults.length} අතර තෝරන්න! 😕*`,
@@ -1144,7 +1901,7 @@ case 'cinesubz':
 
                                 if (isNaN(seasonNum) || seasonNum < 0 || seasonNum >= seasonsArray.length) {
                                     await socket.sendMessage(sender, {
-                                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                        image:  { url: pickBotImage(sessionConfig) },
                                         caption: formatMessage(
                                             '❌ INVALID SELECTION',
                                             `*වැරදි අංකයක්! 1-${seasonsArray.length} අතර තෝරන්න!*`,
@@ -1191,7 +1948,7 @@ case 'cinesubz':
 
                                         if (isNaN(choiceNum) || choiceNum < 1 || choiceNum > selectedSeason.episodes.length) {
                                             await socket.sendMessage(sender, {
-                                                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                                image:  { url: pickBotImage(sessionConfig) },
                                                 caption: formatMessage(
                                                     '❌ INVALID SELECTION',
                                                     `*වැරදි අංකයක්! 1-${selectedSeason.episodes.length} අතර තෝරන්න!*`,
@@ -1254,7 +2011,7 @@ case 'cinesubz':
 
                                                     if (isNaN(qualityNum) || qualityNum < 0 || qualityNum >= episodeDownloadLinks.length) {
                                                         await socket.sendMessage(sender, {
-                                                            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                                            image:  { url: pickBotImage(sessionConfig) },
                                                             caption: formatMessage(
                                                                 '❌ INVALID SELECTION',
                                                                 `*වැරදි අංකයක්! 1-${episodeDownloadLinks.length} අතර තෝරන්න!*`,
@@ -1272,25 +2029,18 @@ case 'cinesubz':
 
                                                     try {
                                                         // 🟢 NEW: Download API - using selectedQuality.url (full ZT link)
-                                                        const downloadApiUrl = `https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedQuality.url)}&api_key=lakiyaofc2`;
-                                                        const darkShanResponse = await axios.get(downloadApiUrl);
-                                                        const darkShanData = darkShanResponse.data;
-
-                                                        if (!darkShanData.status || !darkShanData.data?.download) {
-                                                            throw new Error('Failed to get download URL');
+                                                        let finalLink;
+                                                        try {
+                                                            const darkShanResponse = await cineGetWithRetry(`https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedQuality.url)}&api_key=lakiyaofc2`);
+                                                            const darkShanData = darkShanResponse.data;
+                                                            if (!darkShanData.status || !darkShanData.data?.download) throw new Error('Failed to get download URL');
+                                                            const finalNonTelegramLinks = darkShanData.data.download.filter(link => link.name && link.name.toLowerCase() !== 'telegram');
+                                                            if (finalNonTelegramLinks.length === 0) throw new Error('No non-Telegram download links available');
+                                                            finalLink = finalNonTelegramLinks.find(link => link.name === 'unknown') || finalNonTelegramLinks[0];
+                                                        } catch (primaryErr) {
+                                                            console.error('[cinesubz tv] primary download API failed, trying fallback:', primaryErr.message);
+                                                            finalLink = await cineFallbackEpisodeLink(selectedItem.link, tvInfo.episodes?.list, selectedEpisode);
                                                         }
-
-                                                        const finalDownloadLinks = darkShanData.data.download;
-
-                                                        const finalNonTelegramLinks = finalDownloadLinks.filter(link => 
-                                                            link.name && link.name.toLowerCase() !== 'telegram'
-                                                        );
-
-                                                        if (finalNonTelegramLinks.length === 0) {
-                                                            throw new Error('No non-Telegram download links available');
-                                                        }
-
-                                                        const finalLink = finalNonTelegramLinks.find(link => link.name === 'unknown') || finalNonTelegramLinks[0];
 
                                                         await socket.sendMessage(sender, { react: { text: '📥', key: qualityMek.key } });
 
@@ -1310,7 +2060,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                                                     } catch (downloadError) {
                                                         console.error('Download error:', downloadError);
                                                         await socket.sendMessage(sender, {
-                                                            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                                            image:  { url: pickBotImage(sessionConfig) },
                                                             caption: formatMessage(
                                                                 '❌ DOWNLOAD ERROR',
                                                                 `*Download link එක ලබාගැනීමේ දෝෂයක්.*\n${downloadError.message}`,
@@ -1331,7 +2081,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                                         } catch (error) {
                                             console.error('Error fetching episode links:', error);
                                             await socket.sendMessage(sender, {
-                                                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                                image:  { url: pickBotImage(sessionConfig) },
                                                 caption: formatMessage(
                                                     '❌ ERROR',
                                                     `*Download links ලබාගැනීමේ දෝෂයක්*\n${error.message}`,
@@ -1354,7 +2104,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                     } catch (tvShowError) {
                         console.error('TV Show error:', tvShowError);
                         await socket.sendMessage(sender, {
-                            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            image:  { url: pickBotImage(sessionConfig) },
                             caption: formatMessage(
                                 '❌ ERROR',
                                 `*TV series details ලබාගැනීමේ දෝෂයක්*\n${tvShowError.message}`,
@@ -1383,7 +2133,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
 
                         if (validDownloads.length === 0) {
                             await socket.sendMessage(sender, {
-                                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                image:  { url: pickBotImage(sessionConfig) },
                                 caption: formatMessage(
                                     '❌ NO DOWNLOADS',
                                     '*මෙම චිත්‍රපටය සඳහා බාගත කිරීමේ link නොමැත!*',
@@ -1448,7 +2198,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
 
                                 if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= validDownloads.length) {
                                     await socket.sendMessage(sender, {
-                                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                        image:  { url: pickBotImage(sessionConfig) },
                                         caption: formatMessage(
                                             '❌ INVALID SELECTION',
                                             `*වැරදි අංකයක්! 1-${validDownloads.length} අතර තෝරන්න!*`,
@@ -1465,24 +2215,20 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                                 }, { quoted: downloadMek });
 
                                 try {
-                                    const downloadResponse = await axios.get(`https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedDownload.url)}&api_key=lakiyaofc2`);
-                                    const downloadData = downloadResponse.data;
-
-                                    if (!downloadData.status || !downloadData.data?.download) {
-                                        throw new Error('Failed to get download URL');
+                                    let downloadData, preferredLink;
+                                    try {
+                                        const downloadResponse = await cineGetWithRetry(`https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedDownload.url)}&api_key=lakiyaofc2`);
+                                        downloadData = downloadResponse.data;
+                                        if (!downloadData.status || !downloadData.data?.download) throw new Error('Failed to get download URL');
+                                        const nonTelegramLinks = downloadData.data.download.filter(link => link.name && link.name.toLowerCase() !== 'telegram');
+                                        if (nonTelegramLinks.length === 0) throw new Error('No non-Telegram download links available');
+                                        preferredLink = nonTelegramLinks.find(link => link.name === 'unknown') || nonTelegramLinks[0];
+                                    } catch (primaryErr) {
+                                        console.error('[cinesubz] primary download API failed, trying fallback:', primaryErr.message);
+                                        const fb = await cineFallbackMovieLink(selectedItem.link, selectedDownload.quality, choiceNum);
+                                        downloadData = { data: {} };
+                                        preferredLink = { url: fb.url };
                                     }
-
-                                    const downloadLinks = downloadData.data.download;
-
-                                    const nonTelegramLinks = downloadLinks.filter(link => 
-                                        link.name && link.name.toLowerCase() !== 'telegram'
-                                    );
-
-                                    if (nonTelegramLinks.length === 0) {
-                                        throw new Error('No non-Telegram download links available');
-                                    }
-
-                                    const preferredLink = nonTelegramLinks.find(link => link.name === 'unknown') || nonTelegramLinks[0];
 
                                     await socket.sendMessage(sender, { react: { text: '📥', key: downloadMek.key } });
 
@@ -1504,7 +2250,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                                 } catch (downloadError) {
                                     console.error('Download link error:', downloadError);
                                     await socket.sendMessage(sender, {
-                                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                        image:  { url: pickBotImage(sessionConfig) },
                                         caption: formatMessage(
                                             '❌ DOWNLOAD ERROR',
                                             `*Download link එක ලබාගැනීමේ දෝෂයක්.*\n${downloadError.message}`,
@@ -1523,7 +2269,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                     } catch (detailsError) {
                         console.error('Details error:', detailsError);
                         await socket.sendMessage(sender, {
-                            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            image:  { url: pickBotImage(sessionConfig) },
                             caption: formatMessage(
                                 '❌ ERROR',
                                 `*Details ලබාගැනීමේ දෝෂයක්*\n${detailsError.message}`,
@@ -1541,7 +2287,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
     } catch (error) {
         console.error('Cinezub command error:', error);
         await socket.sendMessage(sender, {
-            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image:  { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
@@ -1554,7 +2300,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                 case 'sinhalasub':
     if (!args.length) {
         await socket.sendMessage(sender, {
-             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+             image: { url: pickBotImage(sessionConfig)},
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .sinhalasub spider*',
@@ -1612,7 +2358,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
 
         if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
             await socket.sendMessage(sender, {
-                 image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                 image: { url: pickBotImage(sessionConfig)},
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
@@ -1636,7 +2382,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
         listText += `╰──────────●➤\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
 
         const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+            image: { url: pickBotImage(sessionConfig)},
             caption: listText
         }, { quoted: msg });
 
@@ -1676,7 +2422,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                 const choice = parseInt(messageType) - 1;
                 if (isNaN(choice) || choice < 0 || choice >= movies.length) {
                     await socket.sendMessage(sender, {
-                         image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                         image: { url: pickBotImage(sessionConfig)},
                         caption: formatMessage(
                             '❌ INVALID SELECTION',
                             `*වැරදි අංකයක්! 1-${movies.length} අතර තෝරන්න! 😕*`,
@@ -1711,7 +2457,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
 
                     if (videoDownloads.length === 0) {
                         await socket.sendMessage(sender, {
-                             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                             image: { url: pickBotImage(sessionConfig)},
                             caption: formatMessage(
                                 '❌ NO DOWNLOADS',
                                 '*Pixeldrain බාගත කිරීම් නොමැත!*',
@@ -1740,7 +2486,7 @@ ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
                     );
 
                     const infoMsg = await socket.sendMessage(sender, {
-                        image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: movieInfo.poster || selectedMovie.poster || pickBotImage(sessionConfig) },
                         caption: detailsCaption
                     }, { quoted: replyMek });
 
@@ -1791,7 +2537,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                             if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= videoDownloads.length) {
                                 await socket.sendMessage(sender, {
-                                     image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                                     image: { url: pickBotImage(sessionConfig)},
                                     caption: formatMessage(
                                         '❌ INVALID SELECTION',
                                         `*වැරදි අංකයක්! 1-${videoDownloads.length} අතර තෝරන්න!*`,
@@ -1867,7 +2613,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                             } catch (downloadError) {
                                 console.error('Download link error:', downloadError);
                                 await socket.sendMessage(sender, {
-                                     image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                                     image: { url: pickBotImage(sessionConfig)},
                                     caption: formatMessage(
                                         '❌ DOWNLOAD ERROR',
                                         `*Download link එක ලබාගැනීමේ දෝෂයක්.*\nError: ${downloadError.message}`,
@@ -1895,7 +2641,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                 } catch (infoError) {
                     console.error('Movie info error:', infoError);
                     await socket.sendMessage(sender, {
-                         image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+                         image: { url: pickBotImage(sessionConfig)},
                         caption: formatMessage(
                             '❌ ERROR',
                             `*Movie details ලබාගැනීමේ දෝෂයක්:* ${infoError.message}`,
@@ -1925,7 +2671,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         clearAllSinhalasubListeners();
         await socket.sendMessage(sender, {
-             image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+             image: { url: pickBotImage(sessionConfig)},
             caption: formatMessage(
                 '❌ ERROR',
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
@@ -1938,220 +2684,243 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
     break;    case 'menu':
 case 'help': {
     try {
+        const P = sessionConfig.PREFIX || config.PREFIX || '.';
         const pushName = msg.pushName || 'User';
-        const date = new Date();
-        const slstDate = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Colombo" }));
-        const formattedDate = `${slstDate.getFullYear()}/${slstDate.getMonth() + 1}/${slstDate.getDate()}`;
-        const formattedTime = slstDate.toLocaleTimeString();
-        const hour = slstDate.getHours();
+        const nowSL = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Colombo' }));
+        const pad = (n) => String(n).padStart(2, '0');
+        const dateStr = `${nowSL.getFullYear()}/${pad(nowSL.getMonth() + 1)}/${pad(nowSL.getDate())}`;
+        const timeStr = nowSL.toLocaleTimeString('en-US', { hour12: true });
+        const hr = nowSL.getHours();
+        const greet = hr < 5 ? 'Good Night 🌙' : hr < 12 ? 'Good Morning ✨' : hr < 17 ? 'Good Afternoon 🚀' : hr < 20 ? 'Good Evening 🌇' : 'Good Night 🌙';
+        const upSec = process.uptime();
+        const upStr = `${Math.floor(upSec / 3600)}h ${Math.floor((upSec % 3600) / 60)}m`;
+        const ramMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+        const botName = sessionConfig.BOT_NAME || config.BOT_NAME || 'SHAGGY XMD';
+        const footer = sessionConfig.BOT_FOOTER || config.BOT_FOOTER;
+        const menuImage = { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE }; // menu image eka wenas karanne na
 
-        const greetings = hour < 12 ? `Good Morning✨` :
-                          hour < 15 ? `Good Afternoon🚀` :
-                          hour < 18 ? `Good Evening! 🌟` : `Good Night🌙`;
-
-        const mainMenuMsg =
-`*🌟 𝙃𝙚𝙮 ❟ ${pushName} ✨*
-*🍟 Wᴇʟᴄᴏᴍᴇ ᴛᴏ SHAGGY XMD 🦊*
-*╭─「 ꜱᴛᴀᴛᴜꜱ ᴘᴀɴᴇʟ」*
-*┃ \`🔮 ${greetings}\`*
-*┃ \`⏰ 𝚃𝚒𝚖𝚎\` : ${formattedTime}*
-*┃ \`📆 𝙳𝚊𝚝𝚎\` : ${formattedDate}*
-*┃ \`🎃 𝙱𝚘𝚝 𝙽𝚊𝚖𝚎:\` SHAGGY-XMD*
-*┃ \`📟 𝙿𝚕𝚊𝚝𝚏𝚘𝚛𝚖:\` Linux*
-*╰────────●●►*
-*☱ 🔢 𝚁𝙴𝙿𝙻𝚈 𝚆𝙸𝚃𝙷 𝙽𝚄𝙼𝙱𝙴𝚁 ☱*
-
-*1 ❯❯  𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*
-*2 ❯❯  𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*
-*3 ❯❯  𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*
-*4 ❯❯  𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*
-*5 ❯❯  𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*
-*6 ❯❯  𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*
-
-> SHAGGY XMD ✘ ᴀɪʀ Bᴏᴛ ᴠ2
-> _Crafted by Shaggy Ofc_
-> 🐥 _Web: https://shaggytech.online`;
-
-        const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-            caption: mainMenuMsg
-        }, { quoted: msg });
-
-        const menuMsgID = sentMsg.key.id;
-        const originalSender = (msg.key.participant || msg.key.remoteJid || '').split('@')[0].split(':')[0];
-
-        // ── Menu categories ──
-        const menus = {
+        // ── Categories (every command listed here has a real case) ──
+        const categories = {
             '1': {
-                title: `*🔍 𝚂𝙴𝙰𝚁𝙲𝙷 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 🔍 ꜱᴇᴀʀᴄʜ ᴄᴍᴅꜱ 」*
-  • .cinesubz    — Movie search
-  • .sinhalasub  — Movie search
-  • .cinetv      — TV Series
-  • .movie       — Multi source
-  • .thinkiri    — TheNkiri
-  • .chithrapata — Chithrapata
-  • .anime       — Anime search
-  • .cartoon     — Cartoon search
-  • .
-       — DinkaMovies
-  • .cinemx      — CineMovie
-  • .cartoon2  ----- cartoon dl
-  • .moviemania       — Moviedl
-  • .pupilmovie  — Movie search
-  • .wre    — WWE search
-  • .sinhalatop  — Sub search
-  • .rexporn     — Adult search
-  • .apk         — Mod APK search
-  • .rom         — Game ROM search
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '🎬', title: 'MOVIES & TV',
+                cmds: [
+                    ['cinesubz', 'Sinhala sub movies'],
+                    ['sinhalasub', 'Sinhala sub movies'],
+                    ['cineverse', 'CineVerseLK movies & series'],
+                    ['cinetv', 'TV series'],
+                    ['cinesend', 'CineSubz -> send to group (owner)'],
+                    ['tvsend', 'CineTV -> send to group (owner)'],
+                    ['cin', 'Cine movies (alt)'],
+                    ['movie', 'Multi source search'],
+                    ['movieall', 'All-source search'],
+                    ['moviesublk', 'MovieSubLK'],
+                    ['subzlk', 'SubzLK'],
+                    ['moviemania', 'MovieMania'],
+                    ['lakvision', 'LakVision'],
+                    ['piratelk', 'PirateLK'],
+                    ['dinka', 'DinkaMovies'],
+                    ['cinemx', 'CineMX'],
+                    ['pupilmovie', 'PupilVideo'],
+                    ['chithrapata', 'Chithrapata'],
+                    ['dubzone', 'DubZone'],
+                    ['sinhalatop', 'SinhalaTop'],
+                    ['thinkiri', 'TheNkiri'],
+                    ['tamilmv', 'Tamil movies'],
+                    ['nethmv', 'NethMV vault'],
+                    ['mhbd', 'MovieHubBD'],
+                    ['wrestling', 'WatchWrestling']
+                ]
             },
             '2': {
-                title: `*⬇️ 𝙳𝙾𝚆𝙽𝙻𝙾𝙰𝙳 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 ⬇️ ᴅᴏᴡɴʟᴏᴀᴅ ᴄᴍᴅꜱ 」*
-  • .song        — Music dl
-  • .tiktok      — TikTok dl
-  • .sdl         — Status vid dl
-  • .vv          — View once
-  • .ai          — AI chat
-  • .schedule    — Custom msg
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '⬇️', title: 'DOWNLOADERS',
+                cmds: [
+                    ['song', 'Song / YouTube audio'],
+                    ['csong', 'Song -> channel post (owner)'],
+                    ['vote', 'Channel poll vote (owner)'],
+                    ['chsearch', 'Channel search (owner)'],
+                    ['chfollow', 'Channel follow (owner)'],
+                    ['chunfollow', 'Channel unfollow (owner)'],
+                    ['chreact', 'Channel post react (owner)'],
+                    ['yt', 'YouTube video / audio'],
+                    ['tiktok', 'TikTok (no watermark)'],
+                    ['mediafire', 'MediaFire files  🆕'],
+                    ['gdrive', 'Google Drive files'],
+                    ['apk', 'Mod APK search & dl'],
+                    ['rom', 'Game ROM search & dl'],
+                    ['fitgirl', 'FitGirl repacks'],
+                    ['fginfo', 'FitGirl game info'],
+                    ['sdl', 'Save status video'],
+                    ['vv', 'View-once saver']
+                ]
             },
             '3': {
-                title: `*🎬 𝙼𝙾𝚅𝙸𝙴 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 🎬 ᴍᴏᴠɪᴇ ᴄᴍᴅꜱ 」*
-  • .cinesubz    — Sinhala sub
-  • .sinhalasub  — Sinhala sub
-  • .cinetv      — TV Series
-  • .movie       — Multi source
-  • .subzlk      — Movie dl
-  • moviesubzlk       — Multi source
-  • .moviemania  — Multi source
-  • .zoom        - Multi source
-  • .thinkiri    — TheNkiri
-  • .chithrapata — Chithrapata
-  • .dika       — Movies
-  • .pupilmovie  — PupilVideo
-  • .cartoon     — Cartoons.lk
-  • .anime       — AnimeHeaven
-  • .dubzone     — DubZone
-  • .wrestling  — WatchWrestling
-  • .sinhalatop  — SinhalaTop
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '🎌', title: 'ANIME & CARTOON',
+                cmds: [
+                    ['anime', 'Anime search'],
+                    ['animexin', 'Donghua / Animexin'],
+                    ['cartoon', 'Cartoons.lk'],
+                    ['cartoon2', 'Sinhala cartoons']
+                ]
             },
             '4': {
-                title: `*📱 𝙰𝙿𝙿𝚂 & 𝙶𝙰𝙼𝙴𝚂*`,
-                body:
-`╭─ 「 📱 ᴀᴘᴘꜱ & ɢᴀᴍᴇꜱ 」*
-  • .apk         — Mod APK dl
-  • .rom         — Game ROM dl
-  • .hexrom      — ROM (alias)
-  • .game        — ROM (alias)
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '🛠️', title: 'TOOLS & FUN',
+                cmds: [
+                    ['ai', 'AI chat'],
+                    ['sticker', 'Image → sticker'],
+                    ['toimg', 'Sticker → image'],
+                    ['qr', 'QR code generator'],
+                    ['short', 'URL shortener'],
+                    ['weather', 'Weather report'],
+                    ['calc', 'Calculator'],
+                    ['news', 'Sri Lanka news'],
+                    ['papers', 'Past papers'],
+                    ['schedule', 'Schedule a message'],
+                    ['jid', 'Get chat JID']
+                ]
             },
             '5': {
-                title: `*⚙️ 𝙶𝙴𝙽𝙴𝚁𝙰𝙻 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 ⚙️ ɢᴇɴᴇʀᴀʟ ᴄᴍᴅꜱ 」*
-  • .alive       — Bot status
-  • .menu        — Command menu
-  • .help        — Same as menu
-  • .system      — System info
-  • .ping        — Ping info
-  • .bots        — Active sessions
-  • .jid         — Get chat JID
-  • .sticker     — Image to sticker
-  • .toimg       — Sticker to image
-  • .qr          — QR code generator
-  • .short       — URL shortener
-  • .weather     — Weather report
-  • .calc        — Calculator
-  • .tagall      — Tag all (group)
-  • .groupinfo   — Group info
-  • .owner       — Owner contact
-  • .getkey      — Web panel access key
-  • .pair        — Pair a new number
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '⚙️', title: 'GENERAL & GROUP',
+                cmds: [
+                    ['alive', 'Bot status'],
+                    ['menu', 'This menu'],
+                    ['ping', 'Speed & system info'],
+                    ['owner', 'Owner contact'],
+                    ['pair', 'Pair a new number'],
+                    ['getkey', 'Web panel access key'],
+                    ['license', 'Subscription status'],
+                    ['bots', 'Active sessions'],
+                    ['tagall', 'Tag everyone (group)'],
+                    ['groupinfo', 'Group info']
+                ]
             },
             '6': {
-                title: `*👑 𝙰𝙳𝙼𝙸𝙽 𝙼𝙴𝙽𝚄*`,
-                body:
-`╭─「 👑 ᴀᴅᴍɪɴ ᴄᴍᴅꜱ 」*
-  • .set         — Settings panel
-  • .adauto      — Add auto reply
-  • .delauto     — Delete auto reply
-  • .autorep     — Auto reply list
-  • .pair        — Generate pair code
-  • .reset       — Reset session
-  • .restart     — Restart bot
-  • .stop        — Stop bot
-  • .sessions    — Active sessions
-  • .add         — Add subscription (master only)
-  • .license     — Check subscription status
-╰─ ─ ─ ─ ─ ─ ─ ─ ─╯
-
-⚠️ *Admin only commands*
-
-*0 ❯❯ ⬅️ 𝙱𝙰𝙲𝙺 𝚃𝙾 𝙼𝙰𝙸𝙽*`
+                emoji: '👑', title: 'ADMIN',
+                adminOnly: true,
+                note: '\n⚠️ _Admin / owner only_',
+                cmds: [
+                    ['set', 'Settings panel'],
+                    ['adauto', 'Add auto reply'],
+                    ['delauto', 'Delete auto reply'],
+                    ['autorep', 'Auto reply list'],
+                    ['add', 'Add subscription (master)']
+                ]
             }
         };
 
-        // ── Reply listener ──
+        const total = Object.values(categories).reduce((n, c) => n + c.cmds.length, 0);
+        const catLines = Object.entries(categories)
+            .map(([k, c]) => `│ ${k}\uFE0F\u20E3 ${c.emoji} ${c.title}  ·  ${c.cmds.length}`)
+            .join('\n');
+
+        const btnOn = () => sessionConfig.BUTTON_MODE === 'true' && buttonAllowed();
+        const toggleKey = String(Object.keys(categories).length + 1);
+        const buildMain = () =>
+`╭━━━━━━━━━━━━━━━━━━━╮
+┃  ✦ *${botName}* ✦
+╰━━━━━━━━━━━━━━━━━━━╯
+👋 Hey *${pushName}*!   ${greet}
+
+╭─「 📊 *STATUS* 」
+│ ⏰ Time    : ${timeStr}
+│ 📆 Date    : ${dateStr}
+│ ⚡ Uptime  : ${upStr}
+│ 💾 RAM     : ${ramMB} MB
+│ 🔣 Prefix  : ${P}
+│ 🌐 Mode    : ${sessionConfig.MODE || config.MODE}
+│ 🧩 Cmds    : ${total}
+╰──────────────────
+
+╭─「 📂 *MENU LIST* 」
+${catLines}
+│ ${toggleKey}\uFE0F\u20E3 🔘 BUTTON MODE  ·  ${!buttonAllowed() ? '🔒 LOCKED' : btnOn() ? 'ON ✅' : 'OFF ❌'}
+╰──────────────────
+💬 _Reply to this message with a number (1-${toggleKey})_
+
+> ${footer}`;
+
+        const renderCategory = (c) => {
+            const rows = c.cmds.map(([cmd, desc]) => `│ ➤ *${P}${cmd}*\n│    ↳ _${desc}_`).join('\n');
+            return `╭─「 ${c.emoji} *${c.title}* 」\n${rows}\n╰──────────────────${c.note || ''}\n\n↩️ Reply *0* — back to main menu\n\n> ${footer}`;
+        };
+
+        const menuIds = new Set();
+        const sentMsg = await socket.sendMessage(sender, { image: menuImage, caption: buildMain() }, { quoted: msg });
+        if (sentMsg?.key?.id) menuIds.add(sentMsg.key.id);
+
+        const originalSender = (msg.key.participant || msg.key.remoteJid || '').split('@')[0].split(':')[0];
+
+        // ── Reply listener (works on the main menu AND on category messages) ──
         const handleMenuReply = async ({ messages: replyMsgs }) => {
-            const replyMek = replyMsgs?.[0];
-            if (!replyMek?.message) return;
+            try {
+                const replyMek = replyMsgs?.[0];
+                if (!replyMek?.message) return;
 
-            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === menuMsgID;
-            const replier = (replyMek.key.participant || replyMek.key.remoteJid || '').split('@')[0].split(':')[0];
+                const ctx = replyMek.message.extendedTextMessage?.contextInfo;
+                if (!ctx || !menuIds.has(ctx.stanzaId)) return;
 
-            if (!isReply || replier !== originalSender) return;
+                const replier = (replyMek.key.participant || replyMek.key.remoteJid || '').split('@')[0].split(':')[0];
+                if (replier !== originalSender) return;
 
-            // ─── Back to main (0) ───
-            if (text === '0') {
-                return socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: mainMenuMsg
-                }, { quoted: replyMek });
-            }
+                const replyText = (replyMek.message.extendedTextMessage?.text || '').trim();
 
-            // ─── Main menu (6) ───
-            if (text === '6') {
-                return socket.sendMessage(sender, {
-                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
-                    caption: mainMenuMsg
-                }, { quoted: replyMek });
-            }
+                if (replyText === '0') {
+                    const s = await socket.sendMessage(sender, { image: menuImage, caption: buildMain() }, { quoted: replyMek });
+                    if (s?.key?.id) menuIds.add(s.key.id);
+                    return;
+                }
 
-            // ─── Category menu (1-5) ───
-            const menu = menus[text];
-            if (menu) {
-                // Admin check for menu 6
-                if (text === '6') {
+                // 🔘 Button mode toggle (owner / admin only)
+                if (replyText === toggleKey) {
+                    const ADMIN_NUMBERS_T = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
+                    if (!isOwner && !ADMIN_NUMBERS_T.includes(senderNumber)) {
+                        await socket.sendMessage(sender, { text: '❌ *Admin only!*' }, { quoted: replyMek });
+                        return;
+                    }
+                    if (!buttonAllowed()) {
+                        await socket.sendMessage(sender, { text: buttonLockedMsg }, { quoted: replyMek });
+                        return;
+                    }
+                    const newVal = btnOn() ? 'false' : 'true';
+                    sessionConfig = { ...sessionConfig, BUTTON_MODE: newVal };
+                    await updateUserConfig(sanitizedNumber, sessionConfig);
+                    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+                    await socket.sendMessage(sender, { text: `🔘 *Button Mode ${newVal === 'true' ? 'ON ✅' : 'OFF ❌'}*` }, { quoted: replyMek });
+                    const sm = await socket.sendMessage(sender, { image: menuImage, caption: buildMain() }, { quoted: replyMek });
+                    if (sm?.key?.id) menuIds.add(sm.key.id);
+                    return;
+                }
+
+                const cat = categories[replyText];
+                if (!cat) return;
+
+                if (cat.adminOnly) {
                     const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || '').split(',').map(n => n.trim()).filter(Boolean);
                     if (!isOwner && !ADMIN_NUMBERS.includes(senderNumber)) {
-                        return socket.sendMessage(sender, {
-                            text: `❌ *Admin only!*`
-                        }, { quoted: replyMek });
+                        await socket.sendMessage(sender, { text: '❌ *Admin only!*' }, { quoted: replyMek });
+                        return;
                     }
                 }
-                
-                await socket.sendMessage(sender, {
-                    text: `${menu.title}\n\n${menu.body}`
-                }, { quoted: replyMek });
+
+                let s;
+                if (btnOn()) {
+                    try {
+                        const rows = cat.cmds.map(([cmd, desc]) => ({ title: `${P}${cmd}`, description: desc, id: `BTN|CMD|${cmd}` }));
+                        rows.push({ title: '⬅️ Back to menu', description: 'Main menu ekata', id: 'BTN|NUM|{ID}|0' });
+                        s = await sendList(socket, sender, {
+                            text: `╭─「 ${cat.emoji} *${cat.title}* 」\n│ 👇 Command ekak select karanna\n╰──────────────────${cat.note || ''}\n\n> ${footer}`,
+                            buttonText: '📋 Commands',
+                            rows,
+                            quoted: replyMek
+                        });
+                    } catch (btnErr) {
+                        console.error('Menu button list failed, using text:', btnErr.message);
+                        s = null;
+                    }
+                }
+                if (!s) s = await socket.sendMessage(sender, { text: renderCategory(cat) }, { quoted: replyMek });
+                if (s?.key?.id) menuIds.add(s.key.id);
+            } catch (err) {
+                console.error('Menu reply error:', err.message);
             }
         };
 
@@ -2167,10 +2936,1066 @@ case 'help': {
     }
     break;
 }
+
+case 'alive': {
+    const upSec = process.uptime();
+    const upStr = `${Math.floor(upSec / 3600)}h ${Math.floor((upSec % 3600) / 60)}m ${Math.floor(upSec % 60)}s`;
+    const P = sessionConfig.PREFIX || config.PREFIX || '.';
+    const footer = sessionConfig.BOT_FOOTER || config.BOT_FOOTER;
+    await socket.sendMessage(sender, {
+        image: { url: pickBotImage(sessionConfig) },
+        caption: formatMessage(
+            '✅ I AM ALIVE',
+            `⚡ *Uptime :* ${upStr}\n🔣 *Prefix :* ${P}\n🌐 *Mode :* ${sessionConfig.MODE || config.MODE}\n\n💬 Type *${P}menu* to see all commands`,
+            footer
+        )
+    }, { quoted: msg });
+    break;
+}
+
+case 'cinesend': {
+    if (!isOwner) {
+        await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg });
+        break;
+    }
+    const gsArgs = args.join(' ');
+    const gsComma = gsArgs.indexOf(',');
+    const gsLinkInput = gsComma === -1 ? '' : gsArgs.slice(0, gsComma).trim();
+    const gsQuery = gsComma === -1 ? '' : gsArgs.slice(gsComma + 1).trim();
+    if (!gsLinkInput || !gsQuery) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Use karana widiya:*\n\n\`${sessionConfig.PREFIX || config.PREFIX || '.'}cinesend <group link>, <movie / series name>\`\n\n*Example:*\n${sessionConfig.PREFIX || config.PREFIX || '.'}cinesend https://chat.whatsapp.com/xxxxx, spider man\n\n_Bot number eka e group ekata add wela inna one._`
+        }, { quoted: msg });
+        break;
+    }
+    let targetGroupJid = null;
+    let targetGroupName = 'Group';
+    try {
+        const tg = await resolveTargetGroup(socket, gsLinkInput); // bot eka group eke nathnam link eken join wenawa
+        targetGroupJid = tg.jid;
+        targetGroupName = tg.name;
+    } catch (gsErr) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Group ekata send karanna baha.*\n\n_Link eka waradi, expire wela, ho group eka join wenna ba (admin approval one wenna puluwan)._\n${gsErr.message}`
+        }, { quoted: msg });
+        break;
+    }
+    await socket.sendMessage(sender, { text: `📤 *Send to :* ${targetGroupName}` }, { quoted: msg });
+
+    const cinezubQuerytv = gsQuery;
+    await socket.sendMessage(sender, { text: '📽️ 𝙎𝙚𝙖𝙧𝙘𝙝𝙞𝙣𝙜 𝙤𝙣 𝘾𝙞𝙣𝙚𝙨𝙪𝙗𝙯...' });
+
+    try {
+        const searchResponse = await axios.get(`https://apis.laksidu.site/cinesubz/search?query=${encodeURIComponent(cinezubQuerytv)}&api_key=lakiyaofc2`);
+        const searchData = searchResponse.data;
+
+        if (!searchData.status || !searchData.results || searchData.results.length === 0) {
+            await socket.sendMessage(sender, {
+                image:  { url: pickBotImage(sessionConfig) },
+                caption: formatMessage(
+                    '❌ NO RESULTS',
+                    '*cinesubz හි චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
+                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                )
+            }, { quoted: msg });
+            break;
+        }
+
+        const cinezubResults = searchData.results.slice(0, 25);
+        let listText = `☘️ *𝗠𝗢𝗩𝗜𝗘 : _𝗦𝗘𝗔𝗥𝗖𝗛 𝗥𝗘𝗦𝗨𝗟𝗧𝗦_* 🔍
+╭──────●➤
+🔎 *𝗤𝘂𝗲𝗿𝘆 ➟* _${cinezubQuerytv}_
+📊 *Status ➟* _Results Found_
+╰──────────●➤
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤
+💡 *𝗥ᴇᴘʟʏ ᴡɪᴛʜ ᴀ 𝗡ᴜᴍʙᴇʀ 𝘁ᴏ 𝗦ᴇʟᴇᴄ𝘛*
+*╭──────●➤*\n\n`;
+
+        cinezubResults.forEach((item, index) => {
+            const type = item.link.includes('/tvshows/') ? '📺 TV Series' : '🎬 Movie';
+            listText += `*🍟${index + 1} ║❯❯ ${type} | ${item.title}*\n`;
+        });
+
+        listText += `╰──────────●➤\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
+
+        const sentMsg = await socket.sendMessage(sender, {
+            image: { url: config.BOT_IMAGE},
+            caption: listText
+        }, { quoted: msg });
+
+        const messageID = sentMsg.key.id;
+
+        const handleSelection = async ({ messages: replyMessages }) => {
+            const replyMek = replyMessages[0];
+            if (!replyMek?.message) return;
+
+            const messageType = replyMek.message.conversation || replyMek.message.extendedTextMessage?.text;
+            const isReplyToSentMsg = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+
+            if (isReplyToSentMsg && sender === replyMek.key.remoteJid) {
+                const choice = parseInt(messageType) - 1;
+                if (isNaN(choice) || choice < 0 || choice >= cinezubResults.length) {
+                    await socket.sendMessage(sender, {
+                        image:  { url: pickBotImage(sessionConfig) },
+                        caption: formatMessage(
+                            '❌ INVALID SELECTION',
+                            `*වැරදි අංකයක්! 1-${cinezubResults.length} අතර තෝරන්න! 😕*`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        )
+                    }, { quoted: replyMek });
+                    return;
+                }
+
+                const selectedItem = cinezubResults[choice];
+                const isTvShow = selectedItem.link.includes('/tvshows/');
+
+                if (isTvShow) {
+                    await socket.sendMessage(sender, { 
+                        text: '📺 𝙁𝙚𝙩𝙘𝙝𝙞𝙣𝙜 𝙏𝙑 𝙨𝙚𝙧𝙞𝙚𝙨 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...' 
+                    }, { quoted: replyMek });
+
+                    try {
+                        const tvShowResponse = await axios.get(`https://apis.laksidu.site/cinesubz/tvshow?url=${encodeURIComponent(selectedItem.link)}&api_key=lakiyaofc2`);
+                        const tvShowData = tvShowResponse.data;
+
+                        if (!tvShowData.status || !tvShowData.data) {
+                            throw new Error('Failed to fetch TV show details');
+                        }
+
+                        const tvInfo = tvShowData.data;
+
+                        // 🟢 NEW STRUCTURE - Extract data correctly
+                        const rating = tvInfo.rating?.score || 'N/A';
+                        const totalEpisodes = tvInfo.episodes?.total || 'N/A';
+                        const episodesList = tvInfo.episodes?.list || [];
+
+                        // Group episodes by season (extract season from episode title or URL)
+                        const seasonsMap = {};
+                        episodesList.forEach(ep => {
+                            let seasonNum = '1';
+                            // Try to extract season from episode number or title
+                            const seasonMatch = ep.number?.match(/^(\d+)/);
+                            if (seasonMatch) {
+                                seasonNum = seasonMatch[1];
+                            }
+                            if (!seasonsMap[seasonNum]) {
+                                seasonsMap[seasonNum] = [];
+                            }
+                            seasonsMap[seasonNum].push(ep);
+                        });
+
+                        const seasonsArray = Object.keys(seasonsMap).map(season => ({
+                            season: parseInt(season),
+                            total_episodes: seasonsMap[season].length,
+                            episodes: seasonsMap[season].map(ep => ({
+                                episode: ep.number || '1',
+                                title: ep.title || 'Episode',
+                                url: ep.url || ''
+                            }))
+                        }));
+
+                        const totalSeasons = seasonsArray.length;
+
+                        let tvDetailsText = 
+    `☘️ *𝗧ɪᴛʟᴇ ➟* _${tvInfo.title || 'N/A'}_
+▫️🥇 *𝗜𝗺𝗱𝗯 𝗥ᴀᴛɪɴɢ ➟*  _${rating}_
+▫️📅 *𝗥ᴇʟᴇᴀꜱᴇ 𝗬ᴇᴀʀ ➟*_${tvInfo.year || 'N/A'}_
+▫️📀 *𝗦ᴇᴀꜱᴏɴꜱ ➟* _${totalSeasons} Total_
+▫️📊 *𝗘ᴘɪꜱᴏᴅᴇꜱ ➟* _${totalEpisodes} Total_
+*➟➟➟➟➟➟➟➟➟➟*
+📖 *𝗦𝗧𝗢𝗥𝗬*_${tvInfo.description?.substring(0, 30) || 'No description available.'}..._`;
+
+                        await socket.sendMessage(sender, {
+                            image: { url: tvInfo.poster || sessionConfig.LAKIYA_IMAGE_PATH || config.LAKIYA_IMAGE_PATH },
+                            caption: tvDetailsText
+                        }, { quoted: replyMek });
+
+                        let seasonsText = 
+    `☘️ *𝗧𝗩-𝗦𝗘𝗥𝗜𝗘𝗦 : _𝗦𝗘𝗔𝗦𝗢𝗡 𝗦𝗘𝗟𝗘𝗖𝗧𝗜𝗢𝗡_* 📺
+*➟➟➟➟➟➟➟➟➟➟*
+⬇️🍀 *𝗦𝗘𝗟𝗘𝗖𝗧 𝗬𝗢𝗨𝗥 𝗦𝗘𝗔𝗦𝗢𝗡*
+*➟➟➟➟➟➟➟➟➟➟*
+💡 *𝗥ᴇᴘʟʏ ᴡɪᴛʜ ᴀ 𝗡ᴜᴍʙᴇʀ 𝘁ᴏ 𝗦ᴇʟᴇᴄ𝘛*
+*➟➟➟➟➟➟➟➟➟➟*\n\n`;
+
+                        seasonsArray.forEach((season, idx) => {
+                            seasonsText += `🍀 *${idx + 1} ┃》📀 Season ${season.season} (${season.total_episodes} episodes)*\n`;
+                        });
+
+                        seasonsText += `\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
+
+                        const seasonMsg = await socket.sendMessage(sender, {
+                            text: seasonsText
+                        }, { quoted: replyMek });
+
+                        const seasonMsgID = seasonMsg.key.id;
+
+                        const handleSeasonSelect = async ({ messages: seasonMessages }) => {
+                            const seasonMek = seasonMessages[0];
+                            if (!seasonMek?.message) return;
+
+                            const seasonChoice = seasonMek.message.conversation || seasonMek.message.extendedTextMessage?.text;
+                            const isReplyToSeasonMsg = seasonMek.message.extendedTextMessage?.contextInfo?.stanzaId === seasonMsgID;
+
+                            if (isReplyToSeasonMsg && sender === seasonMek.key.remoteJid) {
+                                const seasonNum = parseInt(seasonChoice) - 1;
+
+                                if (isNaN(seasonNum) || seasonNum < 0 || seasonNum >= seasonsArray.length) {
+                                    await socket.sendMessage(sender, {
+                                        image:  { url: pickBotImage(sessionConfig) },
+                                        caption: formatMessage(
+                                            '❌ INVALID SELECTION',
+                                            `*වැරදි අංකයක්! 1-${seasonsArray.length} අතර තෝරන්න!*`,
+                                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                        )
+                                    }, { quoted: seasonMek });
+                                    return;
+                                }
+
+                                const selectedSeason = seasonsArray[seasonNum];
+
+                                let episodesText =
+    `☘️ *𝗧𝗩-𝗦𝗘𝗥𝗜𝗘𝗦 : _𝗘𝗣𝗜𝗦𝗢𝗗𝗘 𝗦𝗘𝗟𝗘𝗖𝗧𝗜𝗢𝗡_* 📺
+╭──────●➤
+☘️ *𝗧ɪᴛʟᴇ ➟* _${tvInfo.title || 'N/A'}_
+📀 *𝗦ᴇᴀꜱᴏɴ ➟* _Season ${selectedSeason.season}_
+📊 *𝗧ᴏᴛᴀʟ ➟* _${selectedSeason.total_episodes} Episodes_
+╰──────────●➤
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤\n\n`;
+
+                                selectedSeason.episodes.forEach((ep, idx) => {
+                                    episodesText += `*⭐${idx + 1} ║❯❯ 📺 Episode ${ep.episode}: ${ep.title}*\n`;
+                                });
+
+                                episodesText += `\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
+
+                                const episodeMsg = await socket.sendMessage(sender, {
+                                    text: episodesText
+                                }, { quoted: seasonMek });
+
+                                const episodeMsgID = episodeMsg.key.id;
+
+                                const handleEpisodeSelect = async ({ messages: episodeMessages }) => {
+                                    const episodeMek = episodeMessages[0];
+                                    if (!episodeMek?.message) return;
+
+                                    const episodeChoice = episodeMek.message.conversation || episodeMek.message.extendedTextMessage?.text;
+                                    const isReplyToEpisodeMsg = episodeMek.message.extendedTextMessage?.contextInfo?.stanzaId === episodeMsgID;
+
+                                    if (isReplyToEpisodeMsg && sender === episodeMek.key.remoteJid) {
+                                        const choiceNum = parseInt(episodeChoice);
+
+                                        if (isNaN(choiceNum) || choiceNum < 1 || choiceNum > selectedSeason.episodes.length) {
+                                            await socket.sendMessage(sender, {
+                                                image:  { url: pickBotImage(sessionConfig) },
+                                                caption: formatMessage(
+                                                    '❌ INVALID SELECTION',
+                                                    `*වැරදි අංකයක්! 1-${selectedSeason.episodes.length} අතර තෝරන්න!*`,
+                                                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                                )
+                                            }, { quoted: episodeMek });
+                                            return;
+                                        }
+
+                                        const selectedEpisode = selectedSeason.episodes[choiceNum - 1];
+
+                                        await socket.sendMessage(sender, { 
+                                            text: `📥 𝙁𝙚𝙩𝙘𝙝𝙞𝙣𝙜 𝙙𝙤𝙬𝙣𝙡𝙤𝙖𝙙 𝙡𝙞𝙣𝙠𝙨 𝙛𝙤𝙧 S${selectedSeason.season}E${selectedEpisode.episode}...` 
+                                        }, { quoted: episodeMek });
+
+                                        try {
+                                            // 🟢 NEW: Episode API URL
+                                            const episodeResponse = await axios.get(`https://apis.laksidu.site/api/episode?url=${encodeURIComponent(selectedEpisode.url)}&api_key=lakiyaofc2`);
+                                            const episodeData = episodeResponse.data;
+
+                                            if (!episodeData.status || !episodeData.data?.download_links?.length) {
+                                                throw new Error('Failed to get episode download links');
+                                            }
+
+                                            const episodeDownloadLinks = episodeData.data.download_links;
+
+                                            let qualityText = 
+    `☘️ *𝗧𝗩-𝗦𝗘𝗥𝗜𝗘𝗦 : _𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗢𝗣𝗧𝗜𝗢𝗡𝗦_* 📺
+╭──────●➤
+🎬 *𝗧ɪᴛʟᴇ ➟* _${tvInfo.title || 'N/A'}_
+📀 *𝗦ᴇᴀꜱᴏɴ ➟* _Season ${selectedSeason.season}_
+📺 *𝗘ᴘɪꜱᴏᴅᴇ ➟* _${selectedEpisode.episode} : ${selectedEpisode.title}_
+╰──────────●➤
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤\n\n`;
+
+                                            episodeDownloadLinks.forEach((link, idx) => {
+                                                const quality = link.meta || link.type || `Quality ${idx + 1}`;
+                                                qualityText += `🔥 *${idx + 1} ║❯❯ 📥 ${quality}*\n`;
+                                            });
+
+                                            qualityText += `\n${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+
+                                            const qualityMsg = await socket.sendMessage(sender, {
+                                                text: qualityText
+                                            }, { quoted: episodeMek });
+
+                                            const qualityMsgID = qualityMsg.key.id;
+
+                                            const handleQualitySelect = async ({ messages: qualityMessages }) => {
+                                                const qualityMek = qualityMessages[0];
+                                                if (!qualityMek?.message) return;
+
+                                                const qualityChoice = qualityMek.message.conversation || qualityMek.message.extendedTextMessage?.text;
+                                                const isReplyToQualityMsg = qualityMek.message.extendedTextMessage?.contextInfo?.stanzaId === qualityMsgID;
+
+                                                if (isReplyToQualityMsg && sender === qualityMek.key.remoteJid) {
+                                                    const qualityNum = parseInt(qualityChoice) - 1;
+
+                                                    if (isNaN(qualityNum) || qualityNum < 0 || qualityNum >= episodeDownloadLinks.length) {
+                                                        await socket.sendMessage(sender, {
+                                                            image:  { url: pickBotImage(sessionConfig) },
+                                                            caption: formatMessage(
+                                                                '❌ INVALID SELECTION',
+                                                                `*වැරදි අංකයක්! 1-${episodeDownloadLinks.length} අතර තෝරන්න!*`,
+                                                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                                            )
+                                                        }, { quoted: qualityMek });
+                                                        return;
+                                                    }
+
+                                                    const selectedQuality = episodeDownloadLinks[qualityNum];
+
+                                                    await socket.sendMessage(sender, { 
+                                                        text: `⏳ 𝙂𝙚𝙩𝙩𝙞𝙣𝙜 𝙙𝙤𝙬𝙣𝙡𝙤𝙖𝙙 𝙡𝙞𝙣𝙠...` 
+                                                    }, { quoted: qualityMek });
+
+                                                    try {
+                                                        // 🟢 NEW: Download API - using selectedQuality.url (full ZT link)
+                                                        let finalLink;
+                                                        try {
+                                                            const darkShanResponse = await cineGetWithRetry(`https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedQuality.url)}&api_key=lakiyaofc2`);
+                                                            const darkShanData = darkShanResponse.data;
+                                                            if (!darkShanData.status || !darkShanData.data?.download) throw new Error('Failed to get download URL');
+                                                            const finalNonTelegramLinks = darkShanData.data.download.filter(link => link.name && link.name.toLowerCase() !== 'telegram');
+                                                            if (finalNonTelegramLinks.length === 0) throw new Error('No non-Telegram download links available');
+                                                            finalLink = finalNonTelegramLinks.find(link => link.name === 'unknown') || finalNonTelegramLinks[0];
+                                                        } catch (primaryErr) {
+                                                            console.error('[cinesubz tv] primary download API failed, trying fallback:', primaryErr.message);
+                                                            finalLink = await cineFallbackEpisodeLink(selectedItem.link, tvInfo.episodes?.list, selectedEpisode);
+                                                        }
+
+                                                        await socket.sendMessage(sender, { react: { text: '📥', key: qualityMek.key } });
+
+                                                        await socket.sendMessage(targetGroupJid, {
+                                                            image: { url: tvInfo.poster || pickBotImage(sessionConfig) },
+                                                            caption: tvDetailsText
+                                                        });
+                                                        await new Promise(r => setTimeout(r, 2000));
+                                                        await sendToGroupWithFallback(socket, targetGroupJid, {
+                                                            document: { url: finalLink.url },
+                                                            mimetype: 'video/mp4',
+                                                            fileName: `${tvInfo.title || 'Series'} S${selectedSeason.season}E${selectedEpisode.episode} - ${selectedEpisode.title}.mp4`,
+                                                            caption: `*☘️ ${tvInfo.title || 'Series'} - ${selectedSeason.season}*
+
+\`[Episode-${selectedEpisode.episode}]\`
+
+${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                                                        });
+                                                        await socket.sendMessage(sender, { text: `✅ *${tvInfo.title || 'Series'}* S${selectedSeason.season}E${selectedEpisode.episode} group ekata yawwa!\n👥 ${targetGroupName}` }, { quoted: qualityMek });
+
+                                                        await socket.sendMessage(sender, { react: { text: '✅', key: qualityMek.key } });
+
+                                                    } catch (downloadError) {
+                                                        console.error('Download error:', downloadError);
+                                                        await socket.sendMessage(sender, {
+                                                            image:  { url: pickBotImage(sessionConfig) },
+                                                            caption: formatMessage(
+                                                                '❌ DOWNLOAD ERROR',
+                                                                `*Download link එක ලබාගැනීමේ දෝෂයක්.*\n${downloadError.message}`,
+                                                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                                            )
+                                                        }, { quoted: qualityMek });
+                                                    } finally {
+                                                        socket.ev.off('messages.upsert', handleQualitySelect);
+                                                        socket.ev.off('messages.upsert', handleEpisodeSelect);
+                                                        socket.ev.off('messages.upsert', handleSeasonSelect);
+                                                        socket.ev.off('messages.upsert', handleSelection);
+                                                    }
+                                                }
+                                            };
+
+                                            socket.ev.on('messages.upsert', handleQualitySelect);
+
+                                        } catch (error) {
+                                            console.error('Error fetching episode links:', error);
+                                            await socket.sendMessage(sender, {
+                                                image:  { url: pickBotImage(sessionConfig) },
+                                                caption: formatMessage(
+                                                    '❌ ERROR',
+                                                    `*Download links ලබාගැනීමේ දෝෂයක්*\n${error.message}`,
+                                                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                                )
+                                            }, { quoted: episodeMek });
+                                            socket.ev.off('messages.upsert', handleEpisodeSelect);
+                                            socket.ev.off('messages.upsert', handleSeasonSelect);
+                                            socket.ev.off('messages.upsert', handleSelection);
+                                        }
+                                    }
+                                };
+
+                                socket.ev.on('messages.upsert', handleEpisodeSelect);
+                            }
+                        };
+
+                        socket.ev.on('messages.upsert', handleSeasonSelect);
+
+                    } catch (tvShowError) {
+                        console.error('TV Show error:', tvShowError);
+                        await socket.sendMessage(sender, {
+                            image:  { url: pickBotImage(sessionConfig) },
+                            caption: formatMessage(
+                                '❌ ERROR',
+                                `*TV series details ලබාගැනීමේ දෝෂයක්*\n${tvShowError.message}`,
+                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                            )
+                        }, { quoted: replyMek });
+                        socket.ev.off('messages.upsert', handleSelection);
+                    }
+
+                } else {
+                    await socket.sendMessage(sender, { 
+                        text: '📽️ 𝙁𝙚𝙩????𝙞𝙣𝙜 𝙙𝙚𝙩𝙖𝙞𝙡𝙨...' 
+                    }, { quoted: replyMek });
+
+                    try {
+                        const detailsResponse = await axios.get(`https://apis.laksidu.site/cinesubz/details?url=${encodeURIComponent(selectedItem.link)}&api_key=lakiyaofc2`);
+                        const detailsData = detailsResponse.data;
+
+                        if (!detailsData.status || !detailsData.data) {
+                            throw new Error('Failed to fetch details');
+                        }
+
+                        const movieInfo = detailsData.data;
+
+                        const validDownloads = movieInfo.downloads?.filter(dl => dl && dl.quality && dl.url) || [];
+
+                        if (validDownloads.length === 0) {
+                            await socket.sendMessage(sender, {
+                                image:  { url: pickBotImage(sessionConfig) },
+                                caption: formatMessage(
+                                    '❌ NO DOWNLOADS',
+                                    '*මෙම චිත්‍රපටය සඳහා බාගත කිරීමේ link නොමැත!*',
+                                    `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                )
+                            }, { quoted: replyMek });
+                            return;
+                        }
+
+                        const description = movieInfo.description?.substring(0, 300) + (movieInfo.description?.length > 300 ? '...' : '') || 'No description available.';
+
+                        const imdbRating = movieInfo.imdb_rating ? `${movieInfo.imdb_rating}/10` : 'N/A';
+                        const year = movieInfo.year || 'N/A';
+                        const runtime = movieInfo.runtime || 'N/A';
+                        const director = movieInfo.director || 'N/A';
+                        const country = movieInfo.country || 'N/A';
+                        const cast = Array.isArray(movieInfo.cast) ? movieInfo.cast.join(', ') : movieInfo.cast || 'N/A';
+
+                        const movieDetailsCaption = formatMessage(
+                            `☘️ *𝗧ɪᴛʟᴇ ➟* _${movieInfo.title}_`,
+                            `▫️🥇 *𝗜𝗺𝗱𝗯 𝗥ᴀᴛɪɴɢ ➟* _${imdbRating}_
+▫️⏳ *𝗗ᴜʀᴀᴛɪᴏɴ ➟* _${runtime}_
+▫️📅 *𝗥ᴇʟᴇᴀꜱᴇ 𝗬ᴇᴀʀ ➟* _${year}_
+▫️🎬 *𝗗ɪʀᴇᴄᴛᴏʀ ➟* _${director}_
+▫️🌎 *𝗖ᴏᴜɴᴛʀʏ ➟* _${country}_
+▫️👥 *𝗖ᴀꜱᴛ ➟* _${cast}_
+*➟➟➟➟➟➟➟➟➟➟*
+*📖 𝗦𝗧𝗢𝗥𝗬 ➟*_${description}_`,
+                            `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                        );
+
+                        await socket.sendMessage(sender, {
+                            image: { url: movieInfo.poster || sessionConfig.LAKIYA_IMAGE_PATH || config.LAKIYA_IMAGE_PATH },
+                            caption: movieDetailsCaption
+                        }, { quoted: replyMek });
+
+                        const downloadOptionsCaption = formatMessage(
+                            `⬇️🍀 *𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗 𝗢𝗣𝗧𝗜𝗢𝗡𝗦*`,
+                            `${validDownloads.map((dl, i) => `▫️ *${(i + 1).toString().padStart(2, '0')} ❱❱ 📥 ${dl.quality}*`).join('\n')}\n
+
+╭──────●➤
+*🔢 ʀᴇᴘʟʏ ʙᴇʟᴏᴡ ɴᴜᴍʙᴇʀ*
+╰──────────●➤`,
+                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                        );
+
+                        const downloadOptionsMsg = await socket.sendMessage(sender, {
+                            text: downloadOptionsCaption
+                        }, { quoted: replyMek });
+
+                        const optionsMsgID = downloadOptionsMsg.key.id;
+
+                        const handleDownload = async ({ messages: downloadMessages }) => {
+                            const downloadMek = downloadMessages[0];
+                            if (!downloadMek?.message) return;
+
+                            const downloadChoice = downloadMek.message.conversation || downloadMek.message.extendedTextMessage?.text;
+                            const isReplyToOptionsMsg = downloadMek.message.extendedTextMessage?.contextInfo?.stanzaId === optionsMsgID;
+
+                            if (isReplyToOptionsMsg && sender === downloadMek.key.remoteJid) {
+                                const choiceNum = parseInt(downloadChoice) - 1;
+
+                                if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= validDownloads.length) {
+                                    await socket.sendMessage(sender, {
+                                        image:  { url: pickBotImage(sessionConfig) },
+                                        caption: formatMessage(
+                                            '❌ INVALID SELECTION',
+                                            `*වැරදි අංකයක්! 1-${validDownloads.length} අතර තෝරන්න!*`,
+                                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                        )
+                                    }, { quoted: downloadMek });
+                                    return;
+                                }
+
+                                const selectedDownload = validDownloads[choiceNum];
+
+                                await socket.sendMessage(sender, { 
+                                    text: `⏳ 𝙂𝙚𝙩𝙩𝙞𝙣𝙜 𝙙𝙤𝙬𝙣𝙡𝙤𝙖𝙙 𝙡𝙞𝙣𝙠...` 
+                                }, { quoted: downloadMek });
+
+                                try {
+                                    let downloadData, preferredLink;
+                                    try {
+                                        const downloadResponse = await cineGetWithRetry(`https://apis.laksidu.site/dl/cinesubz?url=${encodeURIComponent(selectedDownload.url)}&api_key=lakiyaofc2`);
+                                        downloadData = downloadResponse.data;
+                                        if (!downloadData.status || !downloadData.data?.download) throw new Error('Failed to get download URL');
+                                        const nonTelegramLinks = downloadData.data.download.filter(link => link.name && link.name.toLowerCase() !== 'telegram');
+                                        if (nonTelegramLinks.length === 0) throw new Error('No non-Telegram download links available');
+                                        preferredLink = nonTelegramLinks.find(link => link.name === 'unknown') || nonTelegramLinks[0];
+                                    } catch (primaryErr) {
+                                        console.error('[cinesubz] primary download API failed, trying fallback:', primaryErr.message);
+                                        const fb = await cineFallbackMovieLink(selectedItem.link, selectedDownload.quality, choiceNum);
+                                        downloadData = { data: {} };
+                                        preferredLink = { url: fb.url };
+                                    }
+
+                                    await socket.sendMessage(sender, { react: { text: '📥', key: downloadMek.key } });
+
+                                    await socket.sendMessage(targetGroupJid, {
+                                        image: { url: movieInfo.poster || pickBotImage(sessionConfig) },
+                                        caption: movieDetailsCaption
+                                    });
+                                    await new Promise(r => setTimeout(r, 2000));
+                                    await sendToGroupWithFallback(socket, targetGroupJid, {
+                                        document: { url: preferredLink.url },
+                                        mimetype: 'video/mp4',
+                                        fileName: downloadData.data.title || `${movieInfo.title} ${selectedDownload.quality}.mp4`,
+                                        caption: formatMessage(
+                                            `☘️ ${movieInfo.title}`,
+                                            `\`❚█═${sessionConfig.MOVIE_CAPTION || config.MOVIE_CAPTION}═█❚\`
+                                            
+\`[WEB-DL-${selectedDownload.quality}]\``,
+                                            `${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`
+                                        )
+                                    });
+                                    await socket.sendMessage(sender, { text: `✅ *${movieInfo.title}* (${selectedDownload.quality}) group ekata yawwa!\n👥 ${targetGroupName}` }, { quoted: downloadMek });
+
+                                    await socket.sendMessage(sender, { react: { text: '✅', key: downloadMek.key } });
+
+                                } catch (downloadError) {
+                                    console.error('Download link error:', downloadError);
+                                    await socket.sendMessage(sender, {
+                                        image:  { url: pickBotImage(sessionConfig) },
+                                        caption: formatMessage(
+                                            '❌ DOWNLOAD ERROR',
+                                            `*Download link එක ලබාගැනීමේ දෝෂයක්.*\n${downloadError.message}`,
+                                            `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                                        )
+                                    }, { quoted: downloadMek });
+                                } finally {
+                                    socket.ev.off('messages.upsert', handleDownload);
+                                    socket.ev.off('messages.upsert', handleSelection);
+                                }
+                            }
+                        };
+
+                        socket.ev.on('messages.upsert', handleDownload);
+
+                    } catch (detailsError) {
+                        console.error('Details error:', detailsError);
+                        await socket.sendMessage(sender, {
+                            image:  { url: pickBotImage(sessionConfig) },
+                            caption: formatMessage(
+                                '❌ ERROR',
+                                `*Details ලබාගැනීමේ දෝෂයක්*\n${detailsError.message}`,
+                                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+                            )
+                        }, { quoted: replyMek });
+                        socket.ev.off('messages.upsert', handleSelection);
+                    }
+                }
+            }
+        };
+
+        socket.ev.on('messages.upsert', handleSelection);
+
+    } catch (error) {
+        console.error('Cinezub command error:', error);
+        await socket.sendMessage(sender, {
+            image:  { url: pickBotImage(sessionConfig) },
+            caption: formatMessage(
+                '❌ ERROR',
+                `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
+                `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`
+            )
+        }, { quoted: msg });
+    }
+
+    break;
+}
+
+case 'tvsend': {
+    const DEFAULT_FOOTER = `\n\n> 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗠𝗢𝗩𝗜𝗘 𝗕𝗢𝗧 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ ʟYɴᴋᴏ`;
+
+    if (!isOwner) {
+        await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg });
+        break;
+    }
+    const gsArgs = args.join(' ');
+    const gsComma = gsArgs.indexOf(',');
+    const gsLinkInput = gsComma === -1 ? '' : gsArgs.slice(0, gsComma).trim();
+    const gsQuery = gsComma === -1 ? '' : gsArgs.slice(gsComma + 1).trim();
+    if (!gsLinkInput || !gsQuery) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Use karana widiya:*\n\n\`${sessionConfig.PREFIX || config.PREFIX || '.'}tvsend <group link>, <series / movie name>\`\n\n*Example:*\n${sessionConfig.PREFIX || config.PREFIX || '.'}tvsend https://chat.whatsapp.com/xxxxx, game of thrones\n\n_Bot number eka e group ekata add wela inna one._`
+        }, { quoted: msg });
+        break;
+    }
+    let targetGroupJid = null;
+    let targetGroupName = 'Group';
+    try {
+        const tg = await resolveTargetGroup(socket, gsLinkInput); // bot eka group eke nathnam link eken join wenawa
+        targetGroupJid = tg.jid;
+        targetGroupName = tg.name;
+    } catch (gsErr) {
+        await socket.sendMessage(sender, {
+            text: `❌ *Group ekata send karanna baha.*\n\n_Link eka waradi, expire wela, ho group eka join wenna ba (admin approval one wenna puluwan)._\n${gsErr.message}`
+        }, { quoted: msg });
+        break;
+    }
+    await socket.sendMessage(sender, { text: `📤 *Send to :* ${targetGroupName}` }, { quoted: msg });
+
+    const cinesubQuery = gsQuery;
+    await socket.sendMessage(sender, { 
+        text: `*❪ SEARCHING ❫*\n\n🔍 *Searching Movies...*\n⚡ _Please wait a moment._`
+    });
+
+    const API_BASE = "https://api.chamindu.site";
+    const API_KEY = "chama_api_11230a80e5eed3c1b80bfcc5d1773ec9"; // ඔබේ API Key එක දාන්න
+    const DEFAULT_IMAGE = "https://api.chamindu.site/logo.png";
+
+    try {
+        const searchResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/search?q=${encodeURIComponent(cinesubQuery)}&api_key=${API_KEY}`);
+        const searchData = searchResponse.data;
+
+        if (!searchData.status || !searchData.data || searchData.data.length === 0) {
+            await socket.sendMessage(sender, {
+                text: `*❪ NO RESULTS ❫*\n\n😞 *No Results Found!*\n\n🎬 *Query:* _${cinesubQuery}_\n💡 *Tip:* _Please check the spelling and try again!_${DEFAULT_FOOTER}`
+            }, { quoted: msg });
+            break;
+        }
+
+        const cinesubResults = searchData.data.slice(0, 25);
+        let listText = `*❪ SEARCH RESULTS ❫*\n\n🎯 *Query:* _${cinesubQuery}_\n📊 *Results:* _${cinesubResults.length} Items_\n\n*👇 SELECT A NUMBER 👇*\n\n`;
+
+        cinesubResults.forEach((item, index) => {
+            const typeIcon = item.type === 'tvshows' ? '📺' : '🎥';
+            const num = (index + 1) < 10 ? `0${index + 1}` : `${index + 1}`;
+            listText += `*${num}* ➜ ${typeIcon} _${item.title.substring(0, 30)}_\n`;
+        });
+
+        listText += `${DEFAULT_FOOTER}`;
+
+        const sentMsg = await socket.sendMessage(sender, { text: listText }, { quoted: msg });
+        const messageID = sentMsg.key.id;
+
+        const handleSelection = async ({ messages: replyMessages }) => {
+            const replyMek = replyMessages[0];
+            if (!replyMek?.message) return;
+
+            const messageType = replyMek.message.conversation || replyMek.message.extendedTextMessage?.text;
+            const isReplyToSentMsg = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === messageID;
+
+            if (isReplyToSentMsg && sender === replyMek.key.remoteJid) {
+                const choice = parseInt(messageType) - 1;
+                if (isNaN(choice) || choice < 0 || choice >= cinesubResults.length) {
+                    await socket.sendMessage(sender, {
+                        text: `*❪ INVALID ❫*\n\n⚠️ *Wrong Number!*\n🎯 *Range:* _01 - ${cinesubResults.length}_\n📝 _Please reply with a valid number!_${DEFAULT_FOOTER}`
+                    }, { quoted: replyMek });
+                    return;
+                }
+
+                const selectedItem = cinesubResults[choice];
+                const isTvShow = selectedItem.type === 'tvshows';
+
+                if (isTvShow) {
+                    await socket.sendMessage(sender, { 
+                        text: `*❪ FETCHING ❫*\n\n📺 *Fetching TV Series...*\n⚡ _Please wait..._`
+                    }, { quoted: replyMek });
+
+                    try {
+                        const tvShowResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/tv/info?q=${encodeURIComponent(selectedItem.link)}&api_key=${API_KEY}`);
+                        const tvShowData = tvShowResponse.data;
+
+                        if (!tvShowData.status || !tvShowData.data) {
+                            throw new Error('Failed to fetch TV show details');
+                        }
+
+                        const tvInfo = tvShowData.data;
+
+                        let tvDetailsText = `*❪ TV SERIES DETAILS ❫*\n\n📺 *${tvInfo.title}*\n⭐ 𝗜ᴍᴅʙ ➜ ★ ${tvInfo.rating || 'N/A'}\n📅 𝗬ᴇᴀʀ ➜ ${tvInfo.year || 'N/A'}\n⏳ 𝗥ᴜɴᴛɪᴍᴇ ➜ ${tvInfo.duration || 'N/A'}\n🌍 𝗖ᴏᴜɴ𝘁𝗿ʏ ➜ ${tvInfo.country || 'N/A'}\n🎭 𝗚𝗲𝗻 genres ➜ ${tvInfo.genres ? tvInfo.genres.join(', ') : 'N/A'}\n🎬 𝗗ɪʀᴇᴄᴛᴏʀ ➜ ${tvInfo.directors || 'N/A'}\n⭐ 𝗦ᴛᴀʀ𝘀: ${tvInfo.stars || 'N/A'}\n📝 𝗦𝘁𝗼𝗿𝘆 ➜ ${tvInfo.story ? (tvInfo.story.length > 250 ? tvInfo.story.substring(0, 250) + '...' : tvInfo.story) : 'N/A'}\n🗿 𝗪ᴇʙ ➜ cinesubz.com\n ${DEFAULT_FOOTER}`;
+
+                        const posterUrl = tvInfo.image || selectedItem.image || DEFAULT_IMAGE;
+                        await socket.sendMessage(sender, {
+                            image: { url: posterUrl },
+                            caption: tvDetailsText
+                        }, { quoted: replyMek });
+
+                        // series post eka group ekata
+                        await socket.sendMessage(targetGroupJid, { image: { url: posterUrl }, caption: tvDetailsText });
+                        await new Promise(r => setTimeout(r, 2000));
+
+                        // AUTO DOWNLOAD ALL EPISODES
+                        await socket.sendMessage(sender, { 
+                            text: `*❪ DOWNLOAD EPISODES ❫*\n\n📺 *Series:* _${tvInfo.title}_\n🎬 *Episodes:* _${tvInfo.episodes.length}_\n⚡ _Starting download process..._${DEFAULT_FOOTER}`
+                        }, { quoted: replyMek });
+
+                        let successCount = 0;
+                        let failCount = 0;
+
+                        for (let i = 0; i < tvInfo.episodes.length; i++) {
+                            const episode = tvInfo.episodes[i];
+                            try {
+                                await socket.sendMessage(sender, { 
+                                    text: `*❪ DOWNLOADING ❫*\n\n🎥 *Episode:* _${episode.episode_name}_\n📊 *Progress:* _${i + 1}/${tvInfo.episodes.length}_`
+                                }, { quoted: replyMek });
+
+                                const epDlRes = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/tv/dl?q=${encodeURIComponent(episode.episode_url)}&api_key=${API_KEY}`);
+                                const epDlData = epDlRes.data;
+
+                                if (epDlData.status && epDlData.data && epDlData.data.length > 0) {
+                                    const nonTelegramLinks = epDlData.data.filter(link => 
+                                        link.link && !link.link.includes('t.me') && !link.link.includes('telegram')
+                                    );
+                                    const finalLinkObj = nonTelegramLinks[0] || epDlData.data[0];
+
+                                    await sendToGroupWithFallback(socket, targetGroupJid, {
+                                        document: { url: finalLinkObj.link },
+                                        mimetype: 'video/mp4',
+                                        fileName: `${tvInfo.title} - ${episode.episode_name}.mp4`,
+                                        caption: `*📺 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 𝗠𝗢𝗩𝗜𝗘 𝗕𝗢𝗧 📺*\n\n🎭 *Title:* ${tvInfo.title}\n📌 *Episode:* ${episode.episode_name}\n📊 *Quality:* Direct MP4\n\n${DEFAULT_FOOTER}`
+                                    });
+
+                                    successCount++;
+                                } else {
+                                    failCount++;
+                                }
+
+                                await new Promise(resolve => setTimeout(resolve, 2500));
+
+                            } catch (epError) {
+                                console.error(`Error downloading episode:`, epError);
+                                failCount++;
+                            }
+                        }
+
+                        await socket.sendMessage(sender, { 
+                            text: `*❪ SUMMARY ❫*\n\n📤 *Group:* _${targetGroupName}_\n\n🎉 *Download Complete!*\n\n🎬 *Series:* _${tvInfo.title}_\n✅ *Success:* _${successCount} Episodes_\n❌ *Failed:* _${failCount} Episodes_${DEFAULT_FOOTER}`
+                        }, { quoted: replyMek });
+
+                        socket.ev.off('messages.upsert', handleSelection);
+
+                    } catch (tvShowError) {
+                        console.error('TV Show error:', tvShowError);
+                        await socket.sendMessage(sender, {
+                            text: `*❪ ERROR ❫*\n\n❌ *TV Details Error!*\n🚫 _${tvShowError.message}_${DEFAULT_FOOTER}`
+                        }, { quoted: replyMek });
+                        socket.ev.off('messages.upsert', handleSelection);
+                    }
+
+                } else {
+                    // MOVIE FLOW
+                    await socket.sendMessage(sender, { 
+                        text: `*❪ FETCHING ❫*\n\n🎬 *Fetching Movie...*\n⚡ _Please wait..._`
+                    }, { quoted: replyMek });
+
+                    try {
+                        const detailsResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/infodl?q=${encodeURIComponent(selectedItem.link)}&api_key=${API_KEY}`);
+                        const detailsData = detailsResponse.data;
+
+                        if (!detailsData.status || !detailsData.data) {
+                            throw new Error('Failed to fetch details');
+                        }
+
+                        const movieInfo = detailsData.data;
+                        const validDownloads = movieInfo.downloads || [];
+
+                        if (validDownloads.length === 0) {
+                            await socket.sendMessage(sender, {
+                                text: `*❪ NO DOWNLOADS ❫*\n\n⚠️ *No Downloads Found!*\n😞 _There are no downloads available for this movie!_${DEFAULT_FOOTER}`
+                            }, { quoted: replyMek });
+                            return;
+                        }
+
+                        const movieDetailsText = `*❪ MOVIE DETAILS ❫*\n\n🎬 *${movieInfo.title}*\n⭐ 𝗜𝗠𝗗𝗕 ➜ ★ ${movieInfo.imdb || movieInfo.rating || 'N/A'}\n📅 𝗬𝗲𝗮𝗿 ➜ ${movieInfo.year || 'N/A'}\n⏳ 𝗗𝘂𝗿𝗮𝘁𝗶𝗼𝗻 ➜ ${movieInfo.duration || 'N/A'}\n🌍 𝗖ᴏᴜɴ𝘁𝗿ʏ ➜ ${movieInfo.country || 'N/A'}\n🎭 𝗚𝗲𝗻 genres ➜ ${movieInfo.genres ? movieInfo.genres.join(', ') : 'N/A'}\n🏷️  ➜ ${movieInfo.language || movieInfo.tag || 'N/A'}\n🎬  ➜ ${movieInfo.directors || movieInfo.director || 'N/A'}\n⭐  ➜ ${movieInfo.stars || 'N/A'}\n📝  ➜ ${movieInfo.story ? (movieInfo.story.length > 250 ? movieInfo.story.substring(0, 250) + '...' : movieInfo.story) : 'N/A'}\n🗿 𝗪ᴇʙ ➜ cinesubz.com\n ${DEFAULT_FOOTER}`;
+
+                        const moviePosterUrl = movieInfo.image || selectedItem.image || DEFAULT_IMAGE;
+                        await socket.sendMessage(sender, {
+                            image: { url: moviePosterUrl },
+                            caption: movieDetailsText
+                        }, { quoted: replyMek });
+
+                        const downloadOptionsText = `*❪ DOWNLOADS ❫*\n\n📥 *Select Quality:*\n\n${validDownloads.map((dl, i) => {
+    const num = (i + 1) < 10 ? `0${i + 1}` : `${i + 1}`;
+    const qualityIcon = (dl.quality || '').includes('1080') ? '🔥' : (dl.quality || '').includes('720') ? '💎' : '📱';
+    return `*${num}* ➜ ${qualityIcon} _${dl.quality}_ 💾 _${dl.size || 'N/A'}_`;
+}).join('\n')}\n\n*💬 REPLY TO DOWNLOAD 💬*\n📌 _Reply with the number_${DEFAULT_FOOTER}`;
+
+                        const downloadOptionsMsg = await socket.sendMessage(sender, { text: downloadOptionsText }, { quoted: replyMek });
+                        const optionsMsgID = downloadOptionsMsg.key.id;
+
+                        const handleDownload = async ({ messages: downloadMessages }) => {
+                            const downloadMek = downloadMessages[0];
+                            if (!downloadMek?.message) return;
+
+                            const downloadChoice = downloadMek.message.conversation || downloadMek.message.extendedTextMessage?.text;
+                            const isReplyToOptionsMsg = downloadMek.message.extendedTextMessage?.contextInfo?.stanzaId === optionsMsgID;
+
+                            if (isReplyToOptionsMsg && sender === downloadMek.key.remoteJid) {
+                                const choiceNum = parseInt(downloadChoice) - 1;
+
+                                if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= validDownloads.length) {
+                                    await socket.sendMessage(sender, {
+                                        text: `*❪ INVALID ❫*\n\n⚠️ *Wrong Number!*\n🎯 *Range:* _01 - ${validDownloads.length}_\n📝 _Please reply with a valid number!_${DEFAULT_FOOTER}`
+                                    }, { quoted: downloadMek });
+                                    return;
+                                }
+
+                                const selectedDownload = validDownloads[choiceNum];
+                                await socket.sendMessage(sender, { react: { text: '📥', key: downloadMek.key } });
+
+                                try {
+                                    const finalDirectLink = selectedDownload.link;
+
+                                    await socket.sendMessage(targetGroupJid, { image: { url: moviePosterUrl }, caption: movieDetailsText });
+                                    await new Promise(r => setTimeout(r, 2000));
+                                    await sendToGroupWithFallback(socket, targetGroupJid, {
+                                        document: { url: finalDirectLink },
+                                        mimetype: 'video/mp4',
+                                        fileName: `${movieInfo.title} - ${selectedDownload.quality}.mp4`,
+                                        caption: `*🎬 𝗦𝗛𝗔𝗚𝗚𝗬 𝗠𝗢𝗩𝗜𝗘 🎬*\n\n🎭 *Title:* ${movieInfo.title}\n🌟 *IMDB:* ${movieInfo.imdb || movieInfo.rating || 'N/A'}\n📅 *Year:* ${movieInfo.year || 'N/A'}\n📊 *Quality:* ${selectedDownload.quality}\n💾 *Size:* ${selectedDownload.size || 'N/A'}\n\n${DEFAULT_FOOTER}`
+                                    });
+                                    await socket.sendMessage(sender, { text: `✅ *${movieInfo.title}* (${selectedDownload.quality}) group ekata yawwa!\n👥 ${targetGroupName}` }, { quoted: downloadMek });
+
+                                    await socket.sendMessage(sender, { react: { text: '✅', key: downloadMek.key } });
+
+                                } catch (downloadError) {
+                                    console.error('Download link error:', downloadError);
+                                    await socket.sendMessage(sender, {
+                                        text: `*❪ ERROR ❫*\n\n❌ *Download Failed!*\n🚫 _${downloadError.message}_${DEFAULT_FOOTER}`
+                                    }, { quoted: downloadMek });
+                                } finally {
+                                    socket.ev.off('messages.upsert', handleDownload);
+                                    socket.ev.off('messages.upsert', handleSelection);
+                                }
+                            }
+                        };
+
+                        socket.ev.on('messages.upsert', handleDownload);
+
+                    } catch (detailsError) {
+                        console.error('Details error:', detailsError);
+                        await socket.sendMessage(sender, {
+                            text: `*❪ ERROR ❫*\n\n❌ *Movie Details Error!*\n🚫 _${detailsError.message}_${DEFAULT_FOOTER}`
+                        }, { quoted: replyMek });
+                        socket.ev.off('messages.upsert', handleSelection);
+                    }
+                }
+            }
+        };
+
+        socket.ev.on('messages.upsert', handleSelection);
+
+    } catch (error) {
+        console.error('Cinesubz command error:', error);
+        await socket.sendMessage(sender, {
+            text: `*❪ SYSTEM ERROR ❫*\n\n❌ *System Error!*\n🚫 _${error.message || 'Unknown error'}_\n\n🔄 _Please try again later..._${DEFAULT_FOOTER}`
+        }, { quoted: msg });
+    }
+
+    break;
+}
+
+case 'vote':
+case 'cvote':
+case 'channelvote': {
+    // 🗳️ Channel (newsletter) poll vote - chama-bailez-pro (newsletterSendPollVote) one. Owner witharai.
+    if (!isOwner) {
+        await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg });
+        break;
+    }
+    if (typeof socket.newsletterSendPollVote !== 'function') {
+        await socket.sendMessage(sender, {
+            text: `❌ *Meka chama-bailez-pro version eke nathi.*\n_Engine:_ ${BAILEYS_ACTIVE}`
+        }, { quoted: msg });
+        break;
+    }
+    const vRep = (t) => socket.sendMessage(sender, { text: t }, { quoted: msg });
+    const vCtx = msg.message?.extendedTextMessage?.contextInfo;
+    let vTarget = null, vOption = null, vServerId = null;
+    if (args[0] && (args[0].includes('whatsapp.com/channel/') || args[0].endsWith('@newsletter'))) {
+        vTarget = args[0].trim();
+        if (args.length >= 3 && /^\d+$/.test(args[1].trim()) && !vTarget.match(/\/(\d+)$/)) {
+            vServerId = args[1].trim(); vOption = args.slice(2).join(' ').trim();
+        } else {
+            vOption = args.slice(1).join(' ').trim();
+        }
+    } else if (vCtx?.quotedMessage) {
+        vTarget = vCtx;
+        if (args.length >= 2 && /^\d+$/.test(args[0].trim())) { vServerId = args[0].trim(); vOption = args.slice(1).join(' ').trim(); }
+        else vOption = args.join(' ').trim();
+    }
+    if (!vTarget || !vOption) {
+        await vRep(`🗳️ *Channel Poll Vote*\n\n*Use:*\n• \`${sessionConfig.PREFIX || '.'}vote <channel link>/<serverId> <option / number>\`\n• Poll ekakata reply karala \`${sessionConfig.PREFIX || '.'}vote <option / number>\`\n\n*Example:*\n\`${sessionConfig.PREFIX || '.'}vote https://whatsapp.com/channel/0029VbCi5BT5a23yioUIOp1w/683 1\``);
+        break;
+    }
+    try {
+        await vRep('⏳ *Vote karanawa...*');
+        let vJid = null, vOptions = null, vTitle = null;
+        if (typeof vTarget === 'object') {
+            vJid = vTarget.forwardedNewsletterMessageInfo?.newsletterJid || vTarget.remoteJid;
+            vServerId = (vTarget.forwardedNewsletterMessageInfo?.serverMessageId || vTarget.stanzaId || vTarget.server_id)?.toString();
+            const qp = vTarget.quotedMessage?.pollCreationMessage || vTarget.quotedMessage?.pollCreationMessageV3;
+            if (qp) { vOptions = (qp.options || []).map(o => o.optionName); vTitle = qp.name; }
+        } else {
+            const lm = vTarget.match(/(?:https?:\/\/)?(?:www\.)?whatsapp\.com\/channel\/([a-zA-Z0-9_-]+)(?:\/(\d+))?/i);
+            if (lm) {
+                if (lm[2]) vServerId = lm[2];
+                if (voteInviteCache.has(lm[1])) vJid = voteInviteCache.get(lm[1]);
+                else {
+                    const vm = await socket.newsletterMetadata('invite', lm[1]);
+                    vJid = vm?.id || vm?.jid;
+                    if (vJid) voteInviteCache.set(lm[1], vJid);
+                }
+            } else if (vTarget.endsWith('@newsletter')) vJid = vTarget;
+        }
+        if (!vJid || !vServerId) { await vRep('❌ Channel eka ho poll message ID (/serverId) eka hoyaganna baha.'); break; }
+
+        const vKey = `${vJid}_${vServerId}`;
+        if (votePollCache.has(vKey)) {
+            const c = votePollCache.get(vKey); vOptions = c.options; vTitle = c.name;
+        } else if (!vOptions) {
+            const fr = await socket.query({
+                tag: 'iq',
+                attrs: { id: socket.generateMessageTag(), type: 'get', xmlns: 'newsletter', to: 's.whatsapp.net' },
+                content: [{ tag: 'messages', attrs: { type: 'jid', jid: vJid, count: '40' } }]
+            });
+            const mn = fr?.content?.[0];
+            const found = Array.isArray(mn?.content) ? mn.content.find(m => m.tag === 'message' && String(m.attrs?.server_id) === String(vServerId)) : null;
+            if (!found) { await vRep(`❌ Message ID "${vServerId}" e channel eke na.`); break; }
+            if (found.attrs?.edit === '8') { await vRep(`❌ Message ID "${vServerId}" admin delete karala.`); break; }
+            const pt = found.content?.find(c => c.tag === 'plaintext');
+            if (!pt?.content) { await vRep(`❌ "${vServerId}" poll ekak nemei.`); break; }
+            const buf = typeof pt.content === 'string' ? Buffer.from(pt.content, 'binary') : Buffer.from(pt.content);
+            const dec = BaileysNS.proto.Message.decode(buf);
+            const pm = dec.pollCreationMessage || dec.pollCreationMessageV2 || dec.pollCreationMessageV3;
+            if (!pm) { await vRep(`❌ "${vServerId}" poll ekak nemei.`); break; }
+            vOptions = (pm.options || []).map(o => o.optionName); vTitle = pm.name || '';
+            votePollCache.set(vKey, { options: vOptions, name: vTitle });
+        }
+        let picked = null;
+        if (/^\d+$/.test(vOption)) {
+            const i = parseInt(vOption, 10);
+            if (i < 1 || i > (vOptions?.length || 0)) { await vRep(`❌ Option #${i} na. Options: ${(vOptions || []).map((o, n) => `${n + 1}. ${o}`).join(', ')}`); break; }
+            picked = vOptions[i - 1];
+        } else {
+            picked = (vOptions || []).find(o => o.toLowerCase() === vOption.toLowerCase()) || vOption;
+        }
+        await socket.newsletterSendPollVote(vJid, vServerId, [picked]);
+        await vRep(`✅ *Vote kala!* 🎉\n\n${vTitle ? `📝 *Poll:* ${vTitle}\n` : ''}🔢 *Poll ID:* ${vServerId}\n🔘 *Option:* ${picked}`);
+    } catch (vErr) {
+        console.error('[vote] error:', vErr.message);
+        await vRep(`❌ *Vote Error:* ${vErr.message}`);
+    }
+    break;
+}
+
+case 'chsearch': {
+    if (!isOwner) { await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg }); break; }
+    if (typeof socket.newsletterSearch !== 'function') {
+        await socket.sendMessage(sender, { text: `❌ Meka chama-bailez-pro version eke nathi.\n_Engine: ${BAILEYS_ACTIVE}_` }, { quoted: msg });
+        break;
+    }
+    const chQ = args.join(' ').trim();
+    if (!chQ) { await socket.sendMessage(sender, { text: `❌ Use: \`${sessionConfig.PREFIX || '.'}chsearch <keyword>\`` }, { quoted: msg }); break; }
+    try {
+        const r = await socket.newsletterSearch(chQ);
+        const list = Array.isArray(r) ? r : (r?.result || r?.newsletters || r?.results || []);
+        if (!list.length) { await socket.sendMessage(sender, { text: `❌ "${chQ}" walata channels hamu una na.` }, { quoted: msg }); break; }
+        const lines = list.slice(0, 10).map((c, i) => {
+            const nm = c.name || c.thread_metadata?.name?.text || 'Channel';
+            const subs = c.subscribers ?? c.subscribers_count ?? c.thread_metadata?.subscribers_count ?? '';
+            const inv = c.invite || c.thread_metadata?.invite || '';
+            return `*${i + 1}.* ${nm}${subs ? ` · 👥 ${subs}` : ''}\n   ${c.id || ''}${inv ? `\n   https://whatsapp.com/channel/${inv}` : ''}`;
+        });
+        await socket.sendMessage(sender, { text: `🔎 *Channel search:* ${chQ}\n\n${lines.join('\n\n')}` }, { quoted: msg });
+    } catch (e) {
+        await socket.sendMessage(sender, { text: `❌ *chsearch Error:* ${e.message}` }, { quoted: msg });
+    }
+    break;
+}
+
+case 'chfollow':
+case 'chunfollow':
+case 'chreact': {
+    if (!isOwner) { await socket.sendMessage(sender, { text: '❌ *Owner witharai meka use karanna puluwan.*' }, { quoted: msg }); break; }
+    const chLink = (args[0] || '').trim();
+    const chM = chLink.match(/channel\/([A-Za-z0-9_-]+)(?:\/(\d+))?/);
+    if (!chM && !chLink.endsWith('@newsletter')) {
+        await socket.sendMessage(sender, { text: `❌ *Use:*\n\`${sessionConfig.PREFIX || '.'}chfollow <channel link>\`\n\`${sessionConfig.PREFIX || '.'}chunfollow <channel link>\`\n\`${sessionConfig.PREFIX || '.'}chreact <channel link>/<serverId> 🔥\`` }, { quoted: msg });
+        break;
+    }
+    try {
+        let cJid = chLink.endsWith('@newsletter') ? chLink : null;
+        let cName = 'Channel';
+        if (!cJid) {
+            const cm = await socket.newsletterMetadata('invite', chM[1]);
+            cJid = cm?.id; cName = cm?.name || cName;
+        }
+        if (!cJid) throw new Error('Channel eka hoyaganna baha');
+        if (command === 'chfollow') {
+            await socket.newsletterFollow(cJid);
+            await socket.sendMessage(sender, { text: `✅ *Follow kala:* ${cName}` }, { quoted: msg });
+        } else if (command === 'chunfollow') {
+            await socket.newsletterUnfollow(cJid);
+            await socket.sendMessage(sender, { text: `✅ *Unfollow kala:* ${cName}` }, { quoted: msg });
+        } else {
+            const sid = chM?.[2];
+            const emoji = args[1] || '🔥';
+            if (!sid) throw new Error('Link eke /serverId eka one (whatsapp.com/channel/xxxx/123)');
+            await socket.newsletterReactMessage(cJid, sid, emoji);
+            await socket.sendMessage(sender, { text: `✅ *React kala* ${emoji}\n📢 ${cName} · #${sid}` }, { quoted: msg });
+        }
+    } catch (e) {
+        await socket.sendMessage(sender, { text: `❌ *Error:* ${e.message}` }, { quoted: msg });
+    }
+    break;
+}
+
 case 'singrup':
     if (!args.length || !args.join(' ').includes(',')) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර group link සහ චිත්‍රපටයේ නම ලබාදෙන්න!*\n*උදා: .singrup https://chat.whatsapp.com/xxxxx,spider*',
@@ -2188,7 +4013,7 @@ case 'singrup':
 
     if (!groupLinkInput || !movieQuery) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*Group link සහ movie name දෙකම ලබාදෙන්න!*',
@@ -2206,14 +4031,16 @@ case 'singrup':
 
     // Get target group JID
     let targetGroupJid = null;
+    let targetGroupName = 'Target Group';
     try {
         const groupInfo = await socket.groupGetInviteInfo(groupInviteCode);
         targetGroupJid = groupInfo.id;
+        targetGroupName = groupInfo.subject || targetGroupName;
         console.log('✅ Target group JID:', targetGroupJid);
     } catch (groupErr) {
         console.error('Group link error:', groupErr);
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ GROUP ERROR',
                 `*Group link එක වැරදියි හෝ bot ට access නැහැ!*\nError: ${groupErr.message}`,
@@ -2261,7 +4088,7 @@ case 'singrup':
 
         if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*චිත්‍රපට හමුවෙන්නේ නැත! 😞*',
@@ -2285,7 +4112,7 @@ case 'singrup':
         listText += `╰──────────●➤\n> ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
 
         const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -2312,7 +4139,7 @@ case 'singrup':
                 const choice = parseInt(messageType) - 1;
                 if (isNaN(choice) || choice < 0 || choice >= movies.length) {
                     await socket.sendMessage(sender, {
-                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ INVALID SELECTION',
                             `*වැරදි අංකයක්! 1-${movies.length} අතර තෝරන්න! 😕*`,
@@ -2344,7 +4171,7 @@ case 'singrup':
 
                     if (videoDownloads.length === 0) {
                         await socket.sendMessage(sender, {
-                            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            image: { url: pickBotImage(sessionConfig) },
                             caption: formatMessage(
                                 '❌ NO DOWNLOADS',
                                 '*Pixeldrain බාගත කිරීම් නොමැත!*',
@@ -2373,7 +4200,7 @@ case 'singrup':
                     );
 
                     const infoMsg = await socket.sendMessage(sender, {
-                        image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: movieInfo.poster || selectedMovie.poster || pickBotImage(sessionConfig) },
                         caption: detailsCaption
                     }, { quoted: replyMek });
 
@@ -2411,7 +4238,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                             if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= videoDownloads.length) {
                                 await socket.sendMessage(sender, {
-                                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image: { url: pickBotImage(sessionConfig) },
                                     caption: formatMessage(
                                         '❌ INVALID SELECTION',
                                         `*වැරදි අංකයක්! 1-${videoDownloads.length} අතර තෝරන්න!*`,
@@ -2456,14 +4283,14 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                                 // 1. Send movie post (image + details) to group
                                 await socket.sendMessage(targetGroupJid, {
-                                    image: { url: movieInfo.poster || selectedMovie.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image: { url: movieInfo.poster || selectedMovie.poster || pickBotImage(sessionConfig) },
                                     caption: detailsCaption
                                 });
 
                                 await new Promise(resolve => setTimeout(resolve, 2000));
 
                                 // 2. Send MP4 document to group
-                                await socket.sendMessage(targetGroupJid, {
+                                await sendToGroupWithFallback(socket, targetGroupJid, {
                                     document: { url: finalDownloadUrl },
                                     mimetype: mimeType,
                                     fileName: fileName,
@@ -2473,7 +4300,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                                 // 3. Confirm to user
                                 await socket.sendMessage(sender, { react: { text: '✅', key: downloadMek.key } });
                                 await socket.sendMessage(sender, {
-                                    text: `✅ *සාර්ථකව group එකට යවන ලදී!*\n\n📽️ *${movieInfo.title}*\n📊 *${selectedDownload.quality || 'Unknown'}*\n👥 *Group:* ${groupInfo.subject || 'Target Group'}`
+                                    text: `✅ *සාර්ථකව group එකට යවන ලදී!*\n\n📽️ *${movieInfo.title}*\n📊 *${selectedDownload.quality || 'Unknown'}*\n👥 *Group:* ${targetGroupName}`
                                 }, { quoted: downloadMek });
 
                                 clearAllSingrupListeners();
@@ -2481,7 +4308,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                             } catch (downloadError) {
                                 console.error('Download link error:', downloadError);
                                 await socket.sendMessage(sender, {
-                                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image: { url: pickBotImage(sessionConfig) },
                                     caption: formatMessage(
                                         '❌ DOWNLOAD ERROR',
                                         `*Download link එක ලබාගැනීමේ දෝෂයක්.*\nError: ${downloadError.message}`,
@@ -2507,7 +4334,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                 } catch (infoError) {
                     console.error('Movie info error:', infoError);
                     await socket.sendMessage(sender, {
-                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ ERROR',
                             `*Movie details ලබාගැනීමේ දෝෂයක්:* ${infoError.message}`,
@@ -2534,7 +4361,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
         console.error('Movie command error:', error);
         clearAllSingrupListeners();
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
@@ -2549,7 +4376,7 @@ case 'paper':
 case 'pastpapers': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර සොයන Paper එකේ නම ලබාදෙන්න! උදා: .papers Mathematics*',
@@ -2583,14 +4410,14 @@ case 'pastpapers': {
         const searchRes = await axios.get(`${API_BASE}/papers`, {
             params: { q: query, limit: 15 },
             headers: { 'x-api-key': API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
 
         if (!searchData.success || !searchData.data || searchData.data.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     `*"${query}" සඳහා කිසිදු Paper එකක් හමු නොවීය!*`,
@@ -2612,7 +4439,7 @@ case 'pastpapers': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -2708,7 +4535,7 @@ case 'dinkamovieslk': {
 
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '🎬 DINKAMOVIES SEARCH',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න!*\n\n*📌 Usage:* `.dinka ben 10`\n*📌 Usage:* `.dinka the croods`',
@@ -2775,7 +4602,7 @@ case 'dinkamovieslk': {
                 `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0`,
                 {
                     responseType: 'text',
-                    timeout: 30000,
+                    timeout: 120000,
                     maxRedirects: 5,
                     headers: {
                         'User-Agent': UA,
@@ -2935,13 +4762,13 @@ case 'dinkamovieslk': {
         // ═══ STEP 1 : SEARCH ═══
         const searchRes = await axios.get(`${DINKA_API_BASE}/search`, {
             params: { q: dinkaQuery, api_key: DINKA_API_KEY },
-            timeout: 60000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data || searchData.data.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     `*"${dinkaQuery}"* සඳහා කිසිදු ප්‍රතිඵලයක් හමු නොවීය!`,
@@ -2961,7 +4788,7 @@ case 'dinkamovieslk': {
         listText += `\n📌 _Reply with number to download!_${DEFAULT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: dinkaList[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: dinkaList[0].poster || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -2993,7 +4820,7 @@ case 'dinkamovieslk': {
                 // ═══ STEP 3 : INFO ═══
                 const infoRes = await axios.get(`${DINKA_API_BASE}/infodl`, {
                     params: { q: chosenItem.url, api_key: DINKA_API_KEY },
-                    timeout: 90000
+                    timeout: 120000
                 });
 
                 const mediaData = infoRes.data?.data;
@@ -3032,7 +4859,7 @@ case 'dinkamovieslk': {
                 infoText += `\n👉 *බාගත කිරීමට අදාළ අංකය Reply කරන්න.*\n_✓ = Document • ⚠️ = 2GB+_`;
 
                 const infoMsg = await socket.sendMessage(sender, {
-                    image: { url: mediaData.poster || chosenItem.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: mediaData.poster || chosenItem.poster || pickBotImage(sessionConfig) },
                     caption: infoText
                 }, { quoted: replyMek });
 
@@ -3156,7 +4983,7 @@ case 'mhbd':
 case 'bw': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර Movie නම ලබාදෙන්න! උදා: .mhbd DC*',
@@ -3175,9 +5002,7 @@ case 'bw': {
     // ============================================
     // 🔧 IMPORTS (case එක ඇතුලේ require කරනවා)
     // ============================================
-    const fs = require('fs');
-    const path = require('path');
-    const os = require('os');
+    const os = (await import('os')).default; // ESM-safe (fs/path come from the top-level imports)
 
     // ============================================
     // 🔧 HELPERS
@@ -3218,7 +5043,7 @@ case 'bw': {
     const extractRealMp4Url = async (pageUrl) => {
         try {
             const res = await axios.get(pageUrl, {
-                timeout: 15000,
+                timeout: 120000,
                 maxRedirects: 10,
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -3327,13 +5152,13 @@ case 'bw': {
 
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: query, api_key: API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data?.length) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු Movie එකක් හමු නොවීය!*',
@@ -3360,7 +5185,7 @@ case 'bw': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: results[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: results[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -3372,7 +5197,7 @@ case 'bw': {
         const handleSelection = async ({ messages }) => {
             const replyMek = messages?.[0];
             if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-            if (replyMek.key.fromMe) return;
+            if (replyMek.key.fromMe && !/^\d{1,3}$/.test(extractIncoming(replyMek).text)) return; // own-number test: allow typed/tapped numbers
 
             const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
             const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === searchMsgID;
@@ -3394,7 +5219,7 @@ case 'bw': {
             try {
                 const infoRes = await axios.get(`${API_BASE}/infodl`, {
                     params: { q: chosen.link, api_key: API_KEY },
-                    timeout: 30000
+                    timeout: 120000
                 });
 
                 const data = infoRes.data?.data;
@@ -3450,7 +5275,7 @@ case 'bw': {
                 const handleDownload = async ({ messages: dlMsgs }) => {
                     const dlMek = dlMsgs?.[0];
                     if (!dlMek?.message || dlMek.key.remoteJid !== sender) return;
-                    if (dlMek.key.fromMe) return;
+                    if (dlMek.key.fromMe && !/^\d{1,3}$/.test(extractIncoming(dlMek).text)) return;
 
                     const dlText = (dlMek.message.conversation || dlMek.message.extendedTextMessage?.text || '').trim();
                     const isDlReply = dlMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
@@ -3597,7 +5422,7 @@ case 'cineverse':
 case 'cv': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර Movie/Series නම ලබාදෙන්න! උදා: .movie Vikings*',
@@ -3686,13 +5511,13 @@ case 'cv': {
 
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: query, api_key: API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data?.length) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු Movie/Series එකක් හමු නොවීය!*',
@@ -3712,7 +5537,7 @@ case 'cv': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: results[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: results[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -3720,12 +5545,13 @@ case 'cv': {
 
         const handleSelection = async ({ messages }) => {
             const replyMek = messages?.[0];
-            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-            if (replyMek.key.fromMe) return;
+            if (!replyMek?.message) return;
+            if (replyMek.key.fromMe && !/^\d{1,3}$/.test(extractIncoming(replyMek).text)) return; // own-number test: allow typed/tapped numbers
+            if (!sameChat(replyMek.key, sender)) return;
 
-            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-            const isReply = replyMek.message.extendedTextMessage?.contextInfo?.stanzaId === searchMsgID;
-            if (!isReply) return;
+            // quoted reply OR bare number, ephemeral/wrapped messages, button taps - all handled
+            const { text } = extractIncoming(replyMek);
+            if (!isReplyTo(replyMek, searchMsgID)) return;
 
             const choice = parseInt(text) - 1;
             if (isNaN(choice) || choice < 0 || choice >= results.length) {
@@ -3743,7 +5569,7 @@ case 'cv': {
             try {
                 const infoRes = await axios.get(`${API_BASE}/infodl`, {
                     params: { q: chosen.link, api_key: API_KEY },
-                    timeout: 30000
+                    timeout: 120000
                 });
 
                 const data = infoRes.data?.data;
@@ -3796,12 +5622,12 @@ case 'cv': {
 
                 const handleDownload = async ({ messages: dlMsgs }) => {
                     const dlMek = dlMsgs?.[0];
-                    if (!dlMek?.message || dlMek.key.remoteJid !== sender) return;
-                    if (dlMek.key.fromMe) return;
+                    if (!dlMek?.message) return;
+                    if (dlMek.key.fromMe && !/^\d{1,3}$/.test(extractIncoming(dlMek).text)) return;
+                    if (!sameChat(dlMek.key, sender)) return;
 
-                    const dlText = (dlMek.message.conversation || dlMek.message.extendedTextMessage?.text || '').trim();
-                    const isDlReply = dlMek.message.extendedTextMessage?.contextInfo?.stanzaId === infoMsgID;
-                    if (!isDlReply) return;
+                    const { text: dlText } = extractIncoming(dlMek);
+                    if (!isReplyTo(dlMek, infoMsgID)) return;
 
                     const dlIdx = parseInt(dlText) - 1;
                     if (isNaN(dlIdx) || dlIdx < 0 || dlIdx >= validDownloads.length) {
@@ -3851,7 +5677,7 @@ case 'cv': {
                         await socket.sendMessage(sender, {
                             text: `✅ *Size OK:* ${formatBytes(fileSize)}\n` +
                                   `📥 *Downloading & Uploading...*\n` +
-                                  `⏱️ _මෙයට විනාඩි 2-10ක් ගත විය හැක_\n\n` +
+                                  `⏱️ _මෙයට විනාඩි 2ක් පමණ ගත විය හැක_\n\n` +
                                   `_කරුණාකර රැඳී සිටින්න..._`
                         }, { quoted: dlMek });
                     }
@@ -3883,7 +5709,11 @@ case 'cv': {
                     }
                 };
 
-                global.cineverseSessions[sessionKey].listener = handleDownload;
+                // session eka 5min timeout ekakin marenna kalin download listener eka alut karanawa (10 min)
+                const curSess = global.cineverseSessions[sessionKey] || (global.cineverseSessions[sessionKey] = {});
+                if (curSess.timeout) clearTimeout(curSess.timeout);
+                curSess.listener = handleDownload;
+                curSess.timeout = setTimeout(() => cleanup(), 600000);
                 socket.ev.on('messages.upsert', handleDownload);
 
             } catch (infoErr) {
@@ -3974,7 +5804,7 @@ case 'lv': {
 
     try {
         // ═══ SEARCH ═══
-        const res = await axios.get(`${API_BASE}/api/v1/movie/lakvision/search?q=${encodeURIComponent(query)}&api_key=${API_KEY}`, { timeout: 60000 });
+        const res = await axios.get(`${API_BASE}/api/v1/movie/lakvision/search?q=${encodeURIComponent(query)}&api_key=${API_KEY}`, { timeout: 120000 });
         const results = res.data.data || res.data.results || [];
 
         if (!results.length) {
@@ -4019,7 +5849,7 @@ case 'lv': {
                 }, { quoted: replyMek });
 
                 try {
-                    const detailsRes = await axios.get(`${API_BASE}/api/v1/movie/lakvision/infodl?q=${encodeURIComponent(selectedItem.link || selectedItem.url)}&api_key=${API_KEY}`, { timeout: 90000 });
+                    const detailsRes = await axios.get(`${API_BASE}/api/v1/movie/lakvision/infodl?q=${encodeURIComponent(selectedItem.link || selectedItem.url)}&api_key=${API_KEY}`, { timeout: 120000 });
                     const movieInfo = detailsRes.data.data || {};
                     const validDownloads = movieInfo.downloads || [];
                     const episodes = movieInfo.episodes || [];
@@ -4168,7 +5998,7 @@ case 'plk': {
 
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .piratelk pushpa*',
@@ -4211,7 +6041,7 @@ case 'plk': {
     try {
         // ═══ STEP 1 : SEARCH ═══
         const res = await axios.get(`${API_BASE}/api/v1/movie/piratelk/search?q=${encodeURIComponent(query)}&api_key=${API_KEY}`, {
-            timeout: 60000
+            timeout: 120000
         });
         const results = res.data.data || res.data.results || [];
 
@@ -4263,7 +6093,7 @@ case 'plk': {
                 try {
                     // ═══ STEP 3 : INFO + DL ═══
                     const detailsRes = await axios.get(`${API_BASE}/api/v1/movie/piratelk/infodl?q=${encodeURIComponent(selectedItem.link || selectedItem.url)}&api_key=${API_KEY}`, {
-                        timeout: 90000
+                        timeout: 120000
                     });
                     const movieInfo = detailsRes.data.data || {};
                     const validDownloads = movieInfo.downloads || [];
@@ -4372,6 +6202,176 @@ ${fileUrl}
     }
     break;
 }
+// ==========================================
+// MEDIAFIRE - SHAGGY XMD File Downloader
+// ==========================================
+case 'mediafire':
+case 'mfire':
+case 'mf': {
+    const MF_TEMP = './tmp_mediafire';
+    const MF_MAX_MB = 1900; // WhatsApp document limit is ~2GB
+    const MF_PREFIX = sessionConfig.PREFIX || config.PREFIX || '.';
+    const MF_FOOTER = `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
+    const MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    const mfUrl = (args.join(' ').match(/https?:\/\/(?:www\.)?mediafire\.com\/[^\s]+/i) || [])[0];
+
+    if (!mfUrl) {
+        await socket.sendMessage(sender, {
+            image: { url: pickBotImage(sessionConfig) },
+            caption: formatMessage(
+                '📁 MEDIAFIRE DOWNLOADER',
+                `*MediaFire link ekak denna!*\n\n*📌 Usage:* \`${MF_PREFIX}mediafire <link>\`\n\n*Example:*\n\`${MF_PREFIX}mf https://www.mediafire.com/file/xxxxxxxx/file.zip/file\``,
+                MF_FOOTER
+            )
+        }, { quoted: msg });
+        break;
+    }
+
+    const mfDecode = (s) => String(s)
+        .replace(/&amp;/g, '&').replace(/&#0*38;/g, '&')
+        .replace(/&#x2F;/gi, '/').replace(/&#0*47;/g, '/')
+        .replace(/&quot;/g, '"').replace(/&#0*39;/g, "'");
+
+    const mfMime = {
+        mp4: 'video/mp4', mkv: 'video/x-matroska', avi: 'video/x-msvideo', webm: 'video/webm',
+        mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg',
+        zip: 'application/zip', rar: 'application/vnd.rar', '7z': 'application/x-7z-compressed',
+        apk: 'application/vnd.android.package-archive', pdf: 'application/pdf',
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+        txt: 'text/plain', json: 'application/json',
+        doc: 'application/msword',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        iso: 'application/x-iso9660-image'
+    };
+
+    let mfLocal = null;
+
+    try {
+        await socket.sendMessage(sender, { react: { text: '⏳', key: msg.key } });
+
+        // ── Step 1: open the MediaFire page ──
+        const page = await axios.get(mfUrl, {
+            responseType: 'text',
+            timeout: 120000,
+            maxRedirects: 5,
+            maxContentLength: 5 * 1024 * 1024,
+            headers: {
+                'User-Agent': MF_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9'
+            },
+            validateStatus: () => true
+        });
+        const html = typeof page.data === 'string' ? page.data : '';
+
+        // ── Step 2: find the real download link ──
+        let dl = null;
+
+        // newer layout: base64 "scrambled" url on the download button
+        const scr = html.match(/data-scrambled-url=["']([^"']+)["']/i);
+        if (scr) {
+            try { dl = Buffer.from(scr[1], 'base64').toString('utf8'); } catch {}
+        }
+        // older layout: plain href to downloadXXXX.mediafire.com
+        if (!dl || !/^https?:\/\//i.test(dl)) {
+            const m = html.match(/href=["'](https?:\/\/download[0-9]*\.mediafire\.com\/[^"']+)["']/i)
+                   || html.match(/id=["']downloadButton["'][^>]*href=["'](https?:\/\/[^"']+)["']/i)
+                   || html.match(/aria-label=["']Download file["'][^>]*href=["'](https?:\/\/[^"']+)["']/i);
+            if (m) dl = m[1];
+        }
+        if (dl) dl = mfDecode(dl).trim();
+
+        if (!dl || !/^https?:\/\//i.test(dl)) {
+            throw new Error('Download link eka hoyaganna ba (file eka delete wela / private / MediaFire layout eka wenas wela)');
+        }
+
+        // ── Step 3: file info ──
+        let mfName = (html.match(/<div[^>]*class=["']filename["'][^>]*>\s*([^<]+?)\s*<\/div>/i) || [])[1];
+        if (!mfName) {
+            try { mfName = decodeURIComponent(new URL(dl).pathname.split('/').pop()); } catch {}
+        }
+        mfName = mfDecode(mfName || 'mediafire_file').replace(/[\\/:*?"<>|]/g, '_').trim() || 'mediafire_file';
+
+        const mfSizeStr = (html.match(/Download\s*\(\s*([\d.,]+\s*[KMGT]?B)\s*\)/i) || [])[1] || 'Unknown';
+        const mfExt = path.extname(mfName).slice(1).toLowerCase();
+        const mfMimetype = mfMime[mfExt] || 'application/octet-stream';
+
+        if (parseSizeMB(mfSizeStr) > MF_MAX_MB) {
+            await socket.sendMessage(sender, {
+                text: `⚠️ *File eka loku wadi!* (${mfSizeStr})\nWhatsApp ekata yawanna ba.\n\n🔗 *Direct link:*\n${dl}\n\n> ${MF_FOOTER}`
+            }, { quoted: msg });
+            break;
+        }
+
+        await socket.sendMessage(sender, {
+            text: formatMessage(
+                '📁 MEDIAFIRE DOWNLOADER',
+                `📄 *Name :* ${mfName}\n📦 *Size :* ${mfSizeStr}\n📎 *Type :* ${mfExt ? mfExt.toUpperCase() : 'FILE'}\n\n⏳ _Downloading... karunakara randi sitinna_`,
+                MF_FOOTER
+            )
+        }, { quoted: msg });
+
+        // ── Step 4: stream to disk ──
+        await fs.ensureDir(MF_TEMP);
+        mfLocal = path.join(MF_TEMP, `${Date.now()}_${mfName}`);
+
+        const dlRes = await axios({
+            url: dl,
+            method: 'GET',
+            responseType: 'stream',
+            timeout: 0,
+            maxRedirects: 10,
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity,
+            headers: { 'User-Agent': MF_UA, 'Referer': 'https://www.mediafire.com/', 'Accept': '*/*' }
+        });
+
+        const ct = (dlRes.headers['content-type'] || '').toLowerCase();
+        if (ct.includes('text/html')) {
+            dlRes.data.destroy();
+            throw new Error('MediaFire file ekata wenuwata web page ekak dunna (link expire wela wenna puluwan)');
+        }
+
+        const declaredMB = parseInt(dlRes.headers['content-length'] || '0', 10) / 1024 / 1024;
+        if (declaredMB > MF_MAX_MB) {
+            dlRes.data.destroy();
+            await socket.sendMessage(sender, {
+                text: `⚠️ *File eka loku wadi!* (${declaredMB.toFixed(0)} MB)\n\n🔗 *Direct link:*\n${dl}\n\n> ${MF_FOOTER}`
+            }, { quoted: msg });
+            break;
+        }
+
+        await pipeline(dlRes.data, fs.createWriteStream(mfLocal));
+
+        const st = await fs.stat(mfLocal);
+        if (!st.size) throw new Error('Downloaded file eka empty');
+        const realMB = (st.size / 1024 / 1024).toFixed(2);
+
+        // ── Step 5: send to WhatsApp ──
+        await socket.sendMessage(sender, {
+            document: { url: mfLocal },
+            mimetype: mfMimetype,
+            fileName: mfName,
+            caption: `✅ *𝗠𝗘𝗗𝗜𝗔𝗙𝗜𝗥𝗘 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥*\n\n📄 *Name :* ${mfName}\n📦 *Size :* ${realMB} MB\n\n> ${MF_FOOTER}`
+        }, { quoted: msg });
+
+        await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
+
+    } catch (err) {
+        console.error('[MediaFire] Error:', err.message);
+        await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } }).catch(() => {});
+        await socket.sendMessage(sender, {
+            text: `❌ *MediaFire Error*\n\n_${err.message}_\n\n🔗 *Link:* ${mfUrl}\n💡 Browser ekakin open karala balanna.\n\n> ${MF_FOOTER}`
+        }, { quoted: msg });
+    } finally {
+        if (mfLocal) await fs.remove(mfLocal).catch(() => {});
+    }
+    break;
+}
+
 case 'gdrive':
 case 'gdl': {
     const DEFAULT_FOOTER = `\n\n> 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 🎭\n> 🧬 ᴘᴏᴡᴇʀᴇᴅ ʙʏ 👑 𝗦𝗛𝗔𝗚𝗚𝗬 𝗧𝗘𝗖𝗛`;
@@ -4379,7 +6379,7 @@ case 'gdl': {
 
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර Google Drive link එක ලබාදෙන්න!*\n\n*📌 Usage:* `.gdrive <drive-link>`\n\n*Example:*\n`.gdrive https://drive.google.com/file/d/1pZ2rqEVkUp8g190uvLgjyrnHFk5qzlo5/view`',
@@ -4396,7 +6396,7 @@ case 'gdl': {
         !inputUrl.includes('drive.usercontent.google.com') && 
         !inputUrl.includes('docs.google.com')) {
         return socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ INVALID URL',
                 '*කරුණාකර වලංගු Google Drive link එකක් ලබාදෙන්න!*\n\n*📌 Supported:*\n• `drive.google.com/file/d/ID/view`\n• `docs.google.com/uc?export=download&id=ID`',
@@ -4453,7 +6453,7 @@ case 'gdl': {
                 `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0`,
                 {
                     responseType: 'text',
-                    timeout: 30000,
+                    timeout: 120000,
                     maxRedirects: 5,
                     headers: {
                         'User-Agent': UA,
@@ -4560,10 +6560,11 @@ case 'gdl': {
         text: `*❪ 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 • 𝗚𝗗𝗥𝗜𝗩𝗘 ❫*\n\n⏳ *Fetching file details...*\n📌 *File ID:* \`${fileId.substring(0, 20)}...\`\n\n_කරුණාකර රැඳී සිටින්න..._`
     }, { quoted: msg });
 
+    let localFile = null;
     try {
         // ⭐ Server download
         await fs.ensureDir(TEMP_DIR);
-        const localFile = path.join(TEMP_DIR, `gdrive_${fileId}_${Date.now()}`);
+        localFile = path.join(TEMP_DIR, `gdrive_${fileId}_${Date.now()}`);
 
         await downloadGdriveFile(inputUrl, localFile);
 
@@ -4619,7 +6620,7 @@ ${directUrl}
 > 🎭 𝗦𝗛𝗔𝗚𝗚𝗬 𝗫𝗠𝗗 🎭`
         }, { quoted: msg });
 
-        try { await fs.remove(localFile); } catch {}
+        if (localFile) { try { await fs.remove(localFile); } catch {} }
     }
 
     break;
@@ -4691,7 +6692,7 @@ case 'ytmp3': {
     try {
         // ═══ STEP 1 : FETCH YOUTUBE DATA ═══
         const res = await axios.get(`${API_BASE}/api/v1/download/youtube?url=${encodeURIComponent(url)}&type=${dlType}&api_key=${API_KEY}`, {
-            timeout: 90000
+            timeout: 120000
         });
         const ytData = res.data.data;
 
@@ -4859,7 +6860,7 @@ case 'ax': {
     try {
         // ═══ STEP 1 : SEARCH ═══
         const res = await axios.get(`${API_BASE}/api/v1/anime/animexin/search?q=${encodeURIComponent(query)}&api_key=${API_KEY}`, {
-            timeout: 60000
+            timeout: 120000
         });
         const results = res.data.data || [];
 
@@ -4907,7 +6908,7 @@ case 'ax': {
                 try {
                     // ═══ STEP 3 : INFO + DL ═══
                     const detailsRes = await axios.get(`${API_BASE}/api/v1/anime/animexin/infodl?q=${encodeURIComponent(selectedItem.url || selectedItem.link)}&api_key=${API_KEY}`, {
-                        timeout: 90000
+                        timeout: 120000
                     });
                     const animeInfo = detailsRes.data.data || {};
                     const validDownloads = animeInfo.downloads || [];
@@ -5069,7 +7070,7 @@ case 'ax': {
 
                             try {
                                 const epRes = await axios.get(`${API_BASE}/api/v1/anime/animexin/episode?url=${encodeURIComponent(selectedEp.url)}&api_key=${API_KEY}`, {
-                                    timeout: 60000
+                                    timeout: 120000
                                 });
                                 const epInfo = epRes.data.data || {};
                                 const epDls = epInfo.downloads || [];
@@ -5209,7 +7210,7 @@ case 'cmovie': {
     try {
         // ═══ STEP 1 : SEARCH ═══
         const searchResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/search?q=${encodeURIComponent(cinesubQuery)}&api_key=${API_KEY}`, {
-            timeout: 60000
+            timeout: 120000
         });
         const searchData = searchResponse.data;
 
@@ -5264,7 +7265,7 @@ case 'cmovie': {
 
                     try {
                         const tvShowResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/tv/info?q=${encodeURIComponent(selectedItem.link)}&api_key=${API_KEY}`, {
-                            timeout: 90000
+                            timeout: 120000
                         });
                         const tvShowData = tvShowResponse.data;
 
@@ -5314,7 +7315,7 @@ case 'cmovie': {
 
                                 const epUrl = episode.episode_url || episode.url || episode.link;
                                 const epDlRes = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/tv/dl?q=${encodeURIComponent(epUrl)}&api_key=${API_KEY}`, {
-                                    timeout: 60000
+                                    timeout: 120000
                                 });
                                 const epDlData = epDlRes.data;
 
@@ -5390,7 +7391,7 @@ case 'cmovie': {
 
                 try {
                     const detailsResponse = await axios.get(`${API_BASE}/api/v1/movie/cinesubz/infodl?q=${encodeURIComponent(selectedItem.link)}&api_key=${API_KEY}`, {
-                        timeout: 90000
+                        timeout: 120000
                     });
                     const detailsData = detailsResponse.data;
 
@@ -5623,7 +7624,7 @@ case 'watchwrestling': {
         // ═══ STEP 1 : SEARCH ═══
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: wrestlingQuery, api_key: API_KEY },
-            timeout: 25000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
@@ -5681,7 +7682,7 @@ case 'watchwrestling': {
                     // ═══ STEP 3 : INFO ═══
                     const infoRes = await axios.get(`${API_BASE}/info`, {
                         params: { q: chosenShow.url, api_key: API_KEY },
-                        timeout: 25000
+                        timeout: 120000
                     });
 
                     const showData = infoRes.data?.data;
@@ -5902,7 +7903,7 @@ case 'subz': {
         // ═══ STEP 1 : SEARCH ═══
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: movieQuery, api_key: API_KEY },
-            timeout: 25000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
@@ -5960,7 +7961,7 @@ case 'subz': {
                     // ═══ STEP 3 : INFO ═══
                     const infoRes = await axios.get(`${API_BASE}/infodl`, {
                         params: { q: chosenMovie.link, api_key: API_KEY },
-                        timeout: 25000
+                        timeout: 120000
                     });
 
                     const movieData = infoRes.data?.data;
@@ -6027,7 +8028,7 @@ case 'subz': {
                             try {
                                 const resolveRes = await axios.get(`${API_BASE}/dl`, {
                                     params: { url: rawTarget, api_key: API_KEY },
-                                    timeout: 60000
+                                    timeout: 120000
                                 });
                                 if (resolveRes.data?.direct_link) downloadUrl = resolveRes.data.direct_link;
                                 else if (resolveRes.data?.download_link) downloadUrl = resolveRes.data.download_link;
@@ -6116,7 +8117,7 @@ case 'tamilmv':
 case 'tamil': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .tamilmv Maharaja*',
@@ -6131,8 +8132,8 @@ case 'tamil': {
     const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
     const TEMP_DIR = './tmp_tamilmv';
 
-    const TIMEOUT_API = 60000;
-    const TIMEOUT_INFO = 90000;
+    const TIMEOUT_API = 120000;
+    const TIMEOUT_INFO = 120000;
 
     let tmvSelectionListener = null;
     let tmvDownloadListener = null;
@@ -6200,7 +8201,7 @@ case 'tamil': {
 
         if (!searchData.status || results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage('❌ NO RESULTS', '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*', `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`)
             }, { quoted: msg });
             break;
@@ -6216,7 +8217,7 @@ case 'tamil': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: movieList[0].image || movieList[0].poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: movieList[0].image || movieList[0].poster || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -6269,7 +8270,7 @@ case 'tamil': {
                 infoText += `\n👉 *බාගත කිරීමට අදාළ අංකය Reply කරන්න.*\n_✓ = Document • 🔗 = Link only • ⚠️ = 2GB+_`;
 
                 const infoMsg = await socket.sendMessage(sender, {
-                    image: { url: movieData.image || movieData.poster || chosenMovie.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: movieData.image || movieData.poster || chosenMovie.image || pickBotImage(sessionConfig) },
                     caption: infoText
                 }, { quoted: replyMek });
 
@@ -6403,7 +8404,7 @@ case 'cinemx':
 case 'cmx': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .cinemx Vishwanath and Sons*',
@@ -6419,8 +8420,8 @@ case 'cmx': {
     const TEMP_DIR = './tmp_cinemx';
 
     // ⏱️ TIMEOUTS
-    const TIMEOUT_API = 60000;
-    const TIMEOUT_INFO = 90000;
+    const TIMEOUT_API = 120000;
+    const TIMEOUT_INFO = 120000;
 
     let cmxSelectionListener = null;
     let cmxDownloadListener = null;
@@ -6491,7 +8492,7 @@ case 'cmx': {
 
         if (!searchData.status || results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage('❌ NO RESULTS', '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*', `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`)
             }, { quoted: msg });
             break;
@@ -6507,7 +8508,7 @@ case 'cmx': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: list[0].image || list[0].original_image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: list[0].image || list[0].original_image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -6586,7 +8587,7 @@ case 'cmx': {
                 infoText += `\n👉 *බාගත කිරීමට අදාළ අංකය Reply කරන්න.*\n_✓ = Video • 📝 = Subtitle • ⚠️ = 2GB+_`;
 
                 const infoMsg = await socket.sendMessage(sender, {
-                    image: { url: movie.image || chosen.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: movie.image || chosen.image || pickBotImage(sessionConfig) },
                     caption: infoText
                 }, { quoted: replyMek });
 
@@ -6727,7 +8728,7 @@ case 'vault': {
 
     if (!args.length) {
         return socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර search කිරීමට keyword එකක් දෙන්න!*\n\n*📌 Usage:* `.nethmv action movie`\n*📌 Usage:* `.nethmv spider*',
@@ -6810,7 +8811,7 @@ case 'vault': {
         const searchRes = await axios.get(`${VAULT_API_BASE}/search`, {
             params: { q: searchQuery, limit: 20 },
             headers: { 'x-api-key': VAULT_API_KEY },
-            timeout: 30000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
@@ -6818,7 +8819,7 @@ case 'vault': {
 
         if (!searchData.count || files.length === 0) {
             return socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     `*"${searchQuery}"* සඳහා කිසිදු file එකක් හමු නොවීය!`,
@@ -6876,7 +8877,7 @@ case 'vault': {
                 try {
                     const freshRes = await axios.get(`${VAULT_API_BASE}/files/${chosenFile.id}`, {
                         headers: { 'x-api-key': VAULT_API_KEY },
-                        timeout: 30000
+                        timeout: 120000
                     });
                     if (freshRes.data && freshRes.data.download_url) {
                         fileData = freshRes.data;
@@ -6977,7 +8978,7 @@ case 'mm':
 case 'mmlk': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .moviemania 13 Days*',
@@ -6993,8 +8994,8 @@ case 'mmlk': {
     const TEMP_DIR = './tmp_moviemania';
 
     // ⏱️ TIMEOUTS
-    const TIMEOUT_API = 60000;
-    const TIMEOUT_INFO = 90000;
+    const TIMEOUT_API = 120000;
+    const TIMEOUT_INFO = 120000;
 
     let mmSelectionListener = null;
     let mmDownloadListener = null;
@@ -7057,7 +9058,7 @@ case 'mmlk': {
 
         if (!searchData.status || results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage('❌ NO RESULTS', '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*', `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`)
             }, { quoted: msg });
             break;
@@ -7073,7 +9074,7 @@ case 'mmlk': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: list[0].poster || list[0].thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: list[0].poster || list[0].thumbnail || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -7137,7 +9138,7 @@ case 'mmlk': {
                 infoText += `\n👉 *බාගත කිරීමට අදාළ අංකය Reply කරන්න.*\n_✓ = Video • 📝 = Subtitle • ⚠️ = 2GB+_`;
 
                 const infoMsg = await socket.sendMessage(sender, {
-                    image: { url: movie.image || movie.poster || chosen.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: movie.image || movie.poster || chosen.poster || pickBotImage(sessionConfig) },
                     caption: infoText
                 }, { quoted: replyMek });
 
@@ -7299,7 +9300,7 @@ case 'game': {
 
     const hrGetSize = async (url) => {
         try {
-            const r = await axios.head(url, { timeout: 15000, maxRedirects: 5, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const r = await axios.head(url, { timeout: 120000, maxRedirects: 5, headers: { 'User-Agent': 'Mozilla/5.0' } });
             return parseInt(r.headers['content-length'] || '0');
         } catch (e) { return 0; }
     };
@@ -7479,7 +9480,7 @@ case 'game': {
     let searchRetries = 3;
     while (searchRetries > 0 && !searchResponse) {
         try {
-            searchResponse = await axios.get(`${API_BASE}/api/v1/games/hexrom/search?q=${encodeURIComponent(romQuery)}&api_key=${API_KEY}`, { timeout: 30000 });
+            searchResponse = await axios.get(`${API_BASE}/api/v1/games/hexrom/search?q=${encodeURIComponent(romQuery)}&api_key=${API_KEY}`, { timeout: 120000 });
         } catch (searchErr) {
             searchRetries--;
             if (searchRetries === 0) throw searchErr;
@@ -7564,7 +9565,7 @@ case 'game': {
                 let dlRetries = 3;
                 while (dlRetries > 0 && !dlResponse) {
                     try {
-                        dlResponse = await axios.get(`${API_BASE}/api/v1/games/hexrom/download?q=${encodeURIComponent(romTargetUrl)}&api_key=${API_KEY}`, { timeout: 35000 });
+                        dlResponse = await axios.get(`${API_BASE}/api/v1/games/hexrom/download?q=${encodeURIComponent(romTargetUrl)}&api_key=${API_KEY}`, { timeout: 120000 });
                     } catch (dlErr) {
                         dlRetries--;
                         if (dlRetries === 0) throw dlErr;
@@ -7737,7 +9738,7 @@ case 'cartoon2':
 case 'sinhalacartoon': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර කාටූනයේ නම ලබාදෙන්න! උදා: .cartoon Ben 10*',
@@ -7783,13 +9784,13 @@ case 'sinhalacartoon': {
         // ═══════════════════════════════════════
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: cartoonQuery, api_key: API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data || searchData.data.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු කාටූනයක් හමු නොවීය!*',
@@ -7808,7 +9809,7 @@ case 'sinhalacartoon': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: cartoonList[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: cartoonList[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -7851,7 +9852,7 @@ case 'sinhalacartoon': {
                     // ═══════════════════════════════════
                     const infoRes = await axios.get(`${API_BASE}/infodl`, {
                         params: { q: chosenCartoon.link, api_key: API_KEY },
-                        timeout: 20000
+                        timeout: 120000
                     });
 
                     const cartoonData = infoRes.data?.data;
@@ -7963,7 +9964,7 @@ case 'chithra':
 case 'chmovie': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .chithrapata Vivaah*',
@@ -8008,8 +10009,8 @@ case 'chmovie': {
 
         // ═══ STEP 1 : SEARCH (Movies + TV) ═══
         const [moviesRes, tvRes] = await Promise.all([
-            axios.get(`${API_BASE}/search`, { params: { q: chithraQuery, api_key: API_KEY }, timeout: 20000 }).catch(() => ({ data: { results: [] } })),
-            axios.get(`https://api.chamindu.site/api/v1/tv/chithrapata/search`, { params: { q: chithraQuery, api_key: API_KEY }, timeout: 20000 }).catch(() => ({ data: { results: [] } }))
+            axios.get(`${API_BASE}/search`, { params: { q: chithraQuery, api_key: API_KEY }, timeout: 120000 }).catch(() => ({ data: { results: [] } })),
+            axios.get(`https://api.chamindu.site/api/v1/tv/chithrapata/search`, { params: { q: chithraQuery, api_key: API_KEY }, timeout: 120000 }).catch(() => ({ data: { results: [] } }))
         ]);
 
         const movieResults = (moviesRes.data?.results || []).map(r => ({ ...r, _type: 'movie' }));
@@ -8018,7 +10019,7 @@ case 'chmovie': {
 
         if (allResults.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage('❌ NO RESULTS', '*කිසිදු චිත්‍රපටයක්/සිරිසක් හමු නොවීය!*', `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`)
             }, { quoted: msg });
             break;
@@ -8034,7 +10035,7 @@ case 'chmovie': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: list[0].thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: list[0].thumbnail || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -8064,7 +10065,7 @@ case 'chmovie': {
                 if (chosen._type === 'tv') {
                     const tvInfoRes = await axios.get('https://api.chamindu.site/api/v1/tv/chithrapata/info', {
                         params: { url: chosen.url, api_key: API_KEY },
-                        timeout: 20000
+                        timeout: 120000
                     });
 
                     const tvData = tvInfoRes.data?.data;
@@ -8141,7 +10142,7 @@ case 'chmovie': {
                             try {
                                 const epInfoRes = await axios.get('https://api.chamindu.site/api/v1/tv/chithrapata/episode', {
                                     params: { url: selectedEp.url, api_key: API_KEY },
-                                    timeout: 20000
+                                    timeout: 120000
                                 });
 
                                 const epData = epInfoRes.data?.data || epInfoRes.data;
@@ -8227,7 +10228,7 @@ case 'chmovie': {
                 // ─── MOVIE FLOW ───
                 const infoRes = await axios.get(`${API_BASE}/info`, {
                     params: { url: chosen.url, api_key: API_KEY },
-                    timeout: 20000
+                    timeout: 120000
                 });
 
                 const movieData = infoRes.data?.result;
@@ -8371,7 +10372,7 @@ case 'dubzone':
 case 'dubzonesearch': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර සෙවිය යුතු DubZone චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .dubzone The Lorax*',
@@ -8408,13 +10409,13 @@ case 'dubzonesearch': {
 
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { query: dubQuery },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.success || !searchData.results || searchData.results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*',
@@ -8433,7 +10434,7 @@ case 'dubzonesearch': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: movieList[0].thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: movieList[0].thumbnail || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -8470,7 +10471,7 @@ case 'dubzonesearch': {
                 try {
                     const downloadsRes = await axios.get(`${API_BASE}/downloads`, {
                         params: { slug: chosenMovie.slug },
-                        timeout: 20000
+                        timeout: 120000
                     });
 
                     const dlData = downloadsRes.data;
@@ -8576,7 +10577,7 @@ case 'dubzonesearch': {
 case 'thenkiri': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර සෙවිය යුතු Movie එකේ හෝ TV Series එකේ නම ලබාදෙන්න! උදා: .thinkiri newborn*',
@@ -8609,13 +10610,13 @@ case 'thenkiri': {
 
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { query: thinkiriQuery, api_key: API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data || !searchData.data.results || searchData.data.results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු ප්‍රතිඵලයක් හමු නොවීය!*',
@@ -8638,7 +10639,7 @@ case 'thenkiri': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: movieList[0].thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: movieList[0].thumbnail || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -8673,7 +10674,7 @@ case 'thenkiri': {
                 try {
                     const detailsRes = await axios.get(`${API_BASE}/details`, {
                         params: { url: chosenMovie.url, api_key: API_KEY },
-                        timeout: 20000
+                        timeout: 120000
                     });
 
                     const detailsData = detailsRes.data?.data;
@@ -8725,7 +10726,7 @@ case 'sinhalatop':
 case 'sinhalatopsearch': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර සෙවිය යුතු චිත්‍රපටයේ හෝ කතාමාලාවේ නම ලබාදෙන්න! උදා: .sinhalatop Alpha*',
@@ -8763,13 +10764,13 @@ case 'sinhalatopsearch': {
 
         const searchRes = await axios.get(`${API_BASE}/search`, {
             params: { q: sinhalaTopQuery, api_key: API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data || searchData.data.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු ප්‍රතිඵලයක් හමු නොවීය!*',
@@ -8788,7 +10789,7 @@ case 'sinhalatopsearch': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: movieList[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: movieList[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -8825,7 +10826,7 @@ case 'sinhalatopsearch': {
                 try {
                     const infoRes = await axios.get(`${API_BASE}/infodl`, {
                         params: { q: chosenMovie.link, api_key: API_KEY },
-                        timeout: 20000
+                        timeout: 120000
                     });
 
                     const movieData = infoRes.data?.data;
@@ -8962,45 +10963,53 @@ case 'sdl': {
 }
                 case 'vv':
 case '❤️': {
-    const quoted = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (!quoted) {
-        await socket.sendMessage(sender, { text: '❌ කරුණාකර View Once ෆොටෝ එකකට හෝ Profile Picture එකකට රිප්ளை කර මේ කමාන්ඩ් එක භාවිත කරන්න!' }, { quoted: msg });
+    const ctxInfoVV = msg.message.extendedTextMessage?.contextInfo;
+    const quotedRawVV = ctxInfoVV?.quotedMessage;
+    if (!quotedRawVV) {
+        await socket.sendMessage(sender, { text: '❌ View Once photo / video / audio ekakata *reply* karala .vv kiyala danna.' }, { quoted: msg });
         break;
     }
 
     try {
         await socket.sendMessage(sender, { react: { text: '🔄', key: msg.key } });
 
-        // View Once හෝ සාමාන්‍ය මීඩියා ඩවුන්ලෝඩ් කර ගැනීම
-        let mediaMessage = quoted.imageMessage || quoted.videoMessage || quoted.viewOnceMessageV2?.message?.imageMessage || quoted.viewOnceMessageV2?.message?.videoMessage;
+        const qVV = unwrap(quotedRawVV); // ephemeral / viewOnce v1, v2, v2Extension okkoma ain karanawa
+        let mediaVV = null, typeVV = null;
+        for (const [k, t] of [['imageMessage', 'image'], ['videoMessage', 'video'], ['audioMessage', 'audio']]) {
+            if (qVV[k]) { mediaVV = qVV[k]; typeVV = t; break; }
+        }
 
-        if (mediaMessage) {
-            const stream = await downloadContentFromMessage(mediaMessage, mediaMessage.mimetype.includes('image') ? 'image' : 'video');
-            let buffer = Buffer.from([]);
-            for await (const chunk of stream) {
-                buffer = Buffer.concat([buffer, chunk]);
-            }
+        if (mediaVV) {
+            const streamVV = await downloadContentFromMessage(mediaVV, typeVV);
+            const chunksVV = [];
+            for await (const chunk of streamVV) chunksVV.push(chunk);
+            const bufferVV = Buffer.concat(chunksVV);
+            if (!bufferVV.length) throw new Error('Media eka download karanna baha (expire wela / already opened)');
 
-            const caption = mediaMessage.caption || '';
-            if (mediaMessage.mimetype.includes('image')) {
-                await socket.sendMessage(sender, { image: buffer, caption: `🔓 *View Once / DP Restored*\n\n${caption}` }, { quoted: msg });
+            const capVV = `🔓 *View Once Restored*\n${mediaVV.caption ? `\n${mediaVV.caption}\n` : ''}\n> 🎭 *SHAGGY XMD* 🎭`;
+            if (typeVV === 'image') {
+                await socket.sendMessage(sender, { image: bufferVV, caption: capVV }, { quoted: msg });
+            } else if (typeVV === 'video') {
+                await socket.sendMessage(sender, { video: bufferVV, caption: capVV, mimetype: mediaVV.mimetype || 'video/mp4' }, { quoted: msg });
             } else {
-                await socket.sendMessage(sender, { video: buffer, caption: `🔓 *View Once / DP Restored*\n\n${caption}` }, { quoted: msg });
+                await socket.sendMessage(sender, { audio: bufferVV, mimetype: mediaVV.mimetype || 'audio/mp4', ptt: !!mediaVV.ptt }, { quoted: msg });
             }
         } else {
-            // Profile Picture එකක් නම්
-            let targetJid = msg.message.extendedTextMessage.contextInfo.participant || sender;
-            let ppUrl;
+            // media nathnam - reply karapu kenage Profile Picture eka
+            const targetJidVV = ctxInfoVV.participant || sender;
+            let ppUrlVV;
             try {
-                ppUrl = await socket.profilePictureUrl(targetJid, 'image');
+                ppUrlVV = await socket.profilePictureUrl(targetJidVV, 'image');
             } catch {
-                ppUrl = 'https://i.ibb.co/31P1LkZ/placeholder.jpg';
+                throw new Error('Meka View Once media ekak nemei, Profile Picture ekakuth ganna baha.');
             }
-            await socket.sendMessage(sender, { image: { url: ppUrl }, caption: '👤 *Profile Picture*' }, { quoted: msg });
+            await socket.sendMessage(sender, { image: { url: ppUrlVV }, caption: '👤 *Profile Picture*\n\n> 🎭 *SHAGGY XMD* 🎭' }, { quoted: msg });
         }
         await socket.sendMessage(sender, { react: { text: '✅', key: msg.key } });
     } catch (err) {
-        await socket.sendMessage(sender, { text: `❌ දෝෂයක් ඇති විය: ${err.message}` }, { quoted: msg });
+        console.error('[vv] error:', err.message);
+        await socket.sendMessage(sender, { react: { text: '❌', key: msg.key } }).catch(() => {});
+        await socket.sendMessage(sender, { text: `❌ *VV Error:* ${err.message}` }, { quoted: msg });
     }
     break;
 }
@@ -9270,7 +11279,7 @@ case 'pupil': {
 
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .pupilmovie spider*',
@@ -9338,13 +11347,13 @@ case 'pupil': {
 
         // ═══ STEP 1 : SEARCH ═══
         const searchResponse = await axios.get(`${API_BASE}/pupilvideo/search?query=${encodeURIComponent(movieQueryF)}&api_key=${API_KEY}`, {
-            timeout: 60000
+            timeout: 120000
         });
         const searchData = searchResponse.data;
 
         if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*',
@@ -9365,7 +11374,7 @@ case 'pupil': {
         listText += `\n📌 _Reply with number to download!_${DEFAULT_FOOTER}`;
 
         const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -9384,7 +11393,7 @@ case 'pupil': {
                 const choice = parseInt(messageType) - 1;
                 if (isNaN(choice) || choice < 0 || choice >= movies.length) {
                     return socket.sendMessage(sender, {
-                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ INVALID SELECTION',
                             `*වැරදි අංකයක්! 1-${movies.length} අතර තෝරන්න!*`,
@@ -9401,7 +11410,7 @@ case 'pupil': {
                 try {
                     // ═══ STEP 3 : INFO ═══
                     const infoResponse = await axios.get(`${API_BASE}/pupilvideo/movie?url=${encodeURIComponent(selectedMovie.url)}&api_key=${API_KEY}`, {
-                        timeout: 90000
+                        timeout: 120000
                     });
                     const infoData = infoResponse.data;
 
@@ -9414,7 +11423,7 @@ case 'pupil': {
 
                     if (allDownloadLinks.length === 0) {
                         return socket.sendMessage(sender, {
-                            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            image: { url: pickBotImage(sessionConfig) },
                             caption: formatMessage(
                                 '❌ NO DOWNLOADS',
                                 '*බාගත කිරීම් හමු නොවීය!*',
@@ -9445,7 +11454,7 @@ case 'pupil': {
                     detailsText += DEFAULT_FOOTER;
 
                     const infoMsg = await socket.sendMessage(sender, {
-                        image: { url: movieInfo.poster || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: movieInfo.poster || pickBotImage(sessionConfig) },
                         caption: detailsText
                     }, { quoted: replyMek });
 
@@ -9477,7 +11486,7 @@ case 'pupil': {
 
                             if (isNaN(choiceNum) || choiceNum < 0 || choiceNum >= processedLinks.length) {
                                 return socket.sendMessage(sender, {
-                                    image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image: { url: pickBotImage(sessionConfig) },
                                     caption: formatMessage(
                                         '❌ INVALID SELECTION',
                                         `*වැරදි අංකයක්! 1-${processedLinks.length} අතර තෝරන්න!*`,
@@ -9572,7 +11581,7 @@ case 'pupil': {
                     clearAllPupilListeners();
                     console.error('Movie info error:', infoError);
                     await socket.sendMessage(sender, {
-                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ ERROR',
                             `*Movie details ලබාගැනීමේ දෝෂයක්:* ${infoError.message}`,
@@ -9590,7 +11599,7 @@ case 'pupil': {
         clearAllPupilListeners();
         console.error('PupilMovie command error:', error);
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
@@ -9611,7 +11620,7 @@ case 'mslk': {
 
     if (!args.length) {
         return socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර චිත්‍රපටයේ නම ලබාදෙන්න! උදා: .moviesublk Avatar*',
@@ -9624,8 +11633,8 @@ case 'mslk': {
     const API_BASE = 'https://api.chamindu.site/api/v1/movies/moviesublkcom';
     const API_KEY = 'chama_api_11230a80e5eed3c1b80bfcc5d1773ec9';
 
-    const TIMEOUT_API = 60000;
-    const TIMEOUT_INFO = 90000;
+    const TIMEOUT_API = 120000;
+    const TIMEOUT_INFO = 120000;
 
     let msubzSelectionListener = null;
     let msubzDownloadListener = null;
@@ -9635,6 +11644,17 @@ case 'mslk': {
         if (msubzSelectionListener) { socket.ev.off('messages.upsert', msubzSelectionListener); msubzSelectionListener = null; }
         if (msubzDownloadListener)  { socket.ev.off('messages.upsert', msubzDownloadListener);  msubzDownloadListener  = null; }
         if (msubzMasterTimeout)     { clearTimeout(msubzMasterTimeout); msubzMasterTimeout = null; }
+    };
+
+    const msubzErr = (e) => {
+        if (e.response) {
+            const d = e.response.data;
+            const apiMsg = (d && (d.message || d.error)) || '';
+            return `API error (HTTP ${e.response.status}) ${typeof apiMsg === 'string' ? apiMsg : ''}`.trim();
+        }
+        if (/timeout/i.test(e.message)) return 'API එක slow නිසා timeout වුනා (2 min). නැවත try කරන්න.';
+        if (e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED') return `API server එකට connect වෙන්න බෑ (${e.code}).`;
+        return e.message;
     };
 
     const cleanMsubzTitle = (t = '') =>
@@ -9660,7 +11680,7 @@ case 'mslk': {
 
         if (!searchData.status || results.length === 0) {
             return socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage('❌ NO RESULTS', '*කිසිදු චිත්‍රපටයක් හමු නොවීය!*', `${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`)
             }, { quoted: msg });
         }
@@ -9676,7 +11696,7 @@ case 'mslk': {
         listText += `\n📌 _Reply with number to download!_${DEFAULT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: list[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: list[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -9686,10 +11706,9 @@ case 'mslk': {
         // ═══ STEP 2 : USER PICKS ═══
         const handleMovieSelection = async ({ messages }) => {
             const replyMek = messages?.[0];
-            if (!replyMek?.message || replyMek.key.remoteJid !== sender) return;
-
-            const text = (replyMek.message.conversation || replyMek.message.extendedTextMessage?.text || '').trim();
-            if (replyMek.message.extendedTextMessage?.contextInfo?.stanzaId !== searchMsgID) return;
+            if (!replyMek?.message || !sameChat(replyMek.key, sender)) return;
+            const { text } = extractIncoming(replyMek);
+            if (!isReplyTo(replyMek, searchMsgID)) return;
 
             const choice = parseInt(text) - 1;
             if (isNaN(choice) || choice < 0 || choice >= list.length) {
@@ -9752,7 +11771,7 @@ case 'mslk': {
                 }
 
                 const infoMsg = await socket.sendMessage(sender, {
-                    image: { url: infoData.image || chosen.image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: infoData.image || chosen.image || pickBotImage(sessionConfig) },
                     caption: infoText
                 }, { quoted: replyMek });
 
@@ -9761,10 +11780,9 @@ case 'mslk': {
                 // ═══ STEP 4 : USER PICKS DOWNLOAD ═══
                 const handleDownloadSelection = async ({ messages: dlMessages }) => {
                     const dlMek = dlMessages?.[0];
-                    if (!dlMek?.message || dlMek.key.remoteJid !== sender) return;
-
-                    const dlChoiceText = (dlMek.message.conversation || dlMek.message.extendedTextMessage?.text || '').trim();
-                    if (dlMek.message.extendedTextMessage?.contextInfo?.stanzaId !== infoMsgID) return;
+                    if (!dlMek?.message || !sameChat(dlMek.key, sender)) return;
+                    const { text: dlChoiceText } = extractIncoming(dlMek);
+                    if (!isReplyTo(dlMek, infoMsgID)) return;
 
                     const dlIdx = parseInt(dlChoiceText) - 1;
 
@@ -9864,11 +11882,12 @@ case 'mslk': {
 
                 msubzDownloadListener = handleDownloadSelection;
                 socket.ev.on('messages.upsert', msubzDownloadListener);
+                if (msubzMasterTimeout) clearTimeout(msubzMasterTimeout);
+                msubzMasterTimeout = setTimeout(clearAllMsubzListeners, 600000); // 10 min
 
             } catch (infoErr) {
                 clearAllMsubzListeners();
-                let errMsg = infoErr.message;
-                if (errMsg.includes('timeout')) errMsg = 'API එක slow නිසා timeout වුනා. නැවත try කරන්න.';
+                let errMsg = msubzErr(infoErr);
                 await socket.sendMessage(sender, { text: `❌ MovieSubLK Info Error: ${errMsg}` }, { quoted: replyMek });
             }
         };
@@ -9878,8 +11897,7 @@ case 'mslk': {
 
     } catch (err) {
         clearAllMsubzListeners();
-        let errMsg = err.message;
-        if (errMsg.includes('timeout')) errMsg = 'API එක slow නිසා timeout වුනා. නැවත try කරන්න.';
+        let errMsg = msubzErr(err);
         await socket.sendMessage(sender, { text: `❌ Error: ${errMsg}` }, { quoted: msg });
     }
     break;
@@ -9889,7 +11907,7 @@ case 'rxporn':
 case 'rp': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '🔞 REXPORN SEARCH',
                 '*කරුණාකර search කිරීමට keyword එකක් දෙන්න!*\n\n*📌 Usage:* `.rexporn stepmom`\n*📌 Usage:* `.rexporn milf 18+`',
@@ -9929,13 +11947,13 @@ case 'rp': {
 
         const searchRes = await axios.get(`${RP_API_BASE}/search`, {
             params: { q: rpQuery, page: 1, api_key: RP_API_KEY },
-            timeout: 20000
+            timeout: 120000
         });
 
         const searchData = searchRes.data;
         if (!searchData.success || !searchData.results || searchData.results.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     `*"${rpQuery}"* සඳහා ප්‍රතිඵල හමු නොවීය!`,
@@ -9955,7 +11973,7 @@ case 'rp': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: rpList[0].thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: rpList[0].thumbnail || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -9995,7 +12013,7 @@ case 'rp': {
             try {
                 const dlRes = await axios.get(`${RP_API_BASE}/dl`, {
                     params: { url: chosenVideo.url, api_key: RP_API_KEY },
-                    timeout: 20000
+                    timeout: 120000
                 });
 
                 const dlData = dlRes.data;
@@ -10017,7 +12035,7 @@ case 'rp': {
                 qualityText += `╰──────────●➤\n\n👉 *Quality reply කරන්න (1 = Best)*\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                 const qualityMsg = await socket.sendMessage(sender, {
-                    image: { url: dlData.thumbnail || chosenVideo.thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                    image: { url: dlData.thumbnail || chosenVideo.thumbnail || pickBotImage(sessionConfig) },
                     caption: qualityText
                 }, { quoted: replyMek });
 
@@ -10380,7 +12398,7 @@ case 'm': {
 case 'anime':
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image:  { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර ඇනිමේ එකේ නම ලබාදෙන්න! උදා: .anime naruto*',
@@ -10439,7 +12457,7 @@ case 'anime':
 
         if (!searchData.status || !searchData.data?.results || searchData.data.results.length === 0) {
             await socket.sendMessage(sender, {
-                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image:  { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*ඇනිමේ හමුවෙන්නේ නැත! 😞*',
@@ -10475,7 +12493,7 @@ case 'anime':
         const bannerUrl = config.ANIME_H;
 
         const sentMsg = await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE},
+            image: { url: pickBotImage(sessionConfig)},
             caption: listText
         }, { quoted: msg });
 
@@ -10515,7 +12533,7 @@ case 'anime':
                 const choice = parseInt(messageType) - 1;
                 if (isNaN(choice) || choice < 0 || choice >= animeResults.length) {
                     await socket.sendMessage(sender, {
-                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image:  { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ INVALID SELECTION',
                             `*වැරදි අංකයක්! 1-${animeResults.length} අතර තෝරන්න! 😕*`,
@@ -10547,7 +12565,7 @@ case 'anime':
 
                     if (!animeInfo.episodeList || animeInfo.episodeList.length === 0) {
                         await socket.sendMessage(sender, {
-                            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                            image:  { url: pickBotImage(sessionConfig) },
                             caption: formatMessage(
                                 '❌ NO EPISODES',
                                 '*මෙම ඇනිමේ එක සඳහා කථාංග නොමැත!*',
@@ -10584,7 +12602,7 @@ case 'anime':
 
 > ${sessionConfig.MOVIE_FOOTER || config.MOVIE_FOOTER}`;
 
-                    const posterUrl = animeInfo.poster || selectedItem.thumbnail || sessionConfig.BOT_IMAGE || config.BOT_IMAGE;
+                    const posterUrl = animeInfo.poster || selectedItem.thumbnail || pickBotImage(sessionConfig);
 
 
                     const infoMsg = await socket.sendMessage(sender, {
@@ -10676,7 +12694,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                             console.error(`Download error for episode ${episodeData.episode}:`, error);
                             const episodeNumToShow = episodeData.episode || (episodes.findIndex(ep => ep === episodeData) + 1);
                             await socket.sendMessage(sender, {
-                                image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                image:  { url: pickBotImage(sessionConfig) },
                                 caption: formatMessage(
                                     '❌ DOWNLOAD FAILED',
                                     `*Episode ${episodeNumToShow} download failed*\n${error.message}`,
@@ -10717,7 +12735,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                             if (isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= episodes.length) {
                                 await socket.sendMessage(sender, {
-                                    image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image:  { url: pickBotImage(sessionConfig) },
                                     caption: formatMessage(
                                         '❌ INVALID INPUT',
                                         `*කරුණාකර වලංගු අංකයක් ඇතුළත් කරන්න! (1-${episodes.length})*\n\nඋදා: \`1\` හෝ \`5\``,
@@ -10731,7 +12749,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
                             if (!episodeData) {
                                 await socket.sendMessage(sender, {
-                                    image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                                    image:  { url: pickBotImage(sessionConfig) },
                                     caption: formatMessage(
                                         '❌ INVALID EPISODE',
                                         `*වැරදි අංකයක්! 1-${episodes.length} අතර තෝරන්න.*`,
@@ -10763,7 +12781,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
                 } catch (detailsError) {
                     console.error('Anime details error:', detailsError);
                     await socket.sendMessage(sender, {
-                        image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image:  { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '❌ ERROR',
                             `*Details ලබාගැනීමේ දෝෂයක්*\n${detailsError.message}`,
@@ -10792,7 +12810,7 @@ ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         clearAllAnimeListeners();
         await socket.sendMessage(sender, {
-            image:  { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image:  { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 `*දෝෂයක් ඇතිවුණා:* ${error.message || 'Unknown error'}`,
@@ -11453,7 +13471,7 @@ case 'cartoon':
 case 'cartoonlk': {
     if (!args.length) {
         await socket.sendMessage(sender, {
-            image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: pickBotImage(sessionConfig) },
             caption: formatMessage(
                 '❌ ERROR',
                 '*කරුණාකර කාටූනයේ නම ලබාදෙන්න! උදා: .cartoon Ben 10*',
@@ -11497,7 +13515,7 @@ case 'cartoonlk': {
         const searchData = searchRes.data;
         if (!searchData.status || !searchData.data || searchData.data.length === 0) {
             await socket.sendMessage(sender, {
-                image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                image: { url: pickBotImage(sessionConfig) },
                 caption: formatMessage(
                     '❌ NO RESULTS',
                     '*කිසිදු කාටූනයක් හමු නොවීය!*',
@@ -11516,7 +13534,7 @@ case 'cartoonlk': {
         listText += `╰──────────●➤\n> ${sessionConfig.BOT_FOOTER || config.BOT_FOOTER}`;
 
         const searchMsg = await socket.sendMessage(sender, {
-            image: { url: cartoonList[0].image || sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+            image: { url: cartoonList[0].image || pickBotImage(sessionConfig) },
             caption: listText
         }, { quoted: msg });
 
@@ -11662,24 +13680,25 @@ case 'news':
                               `${newsItem.desc}\n\n` +
                               `🔗 *Link:* ${newsItem.link}`;
 
-                await sock.sendMessage(from, { 
+                await socket.sendMessage(from, { 
                     image: { url: newsItem.image }, 
                     caption: caption 
-                }, { quoted: mek });
+                }, { quoted: msg });
             } else {
-                await sock.sendMessage(from, { text: '❌ පුවත් ලබාගැනීමේදී දෝෂයක් ඇති විය.' }, { quoted: mek });
+                await socket.sendMessage(from, { text: '❌ පුවත් ලබාගැනීමේදී දෝෂයක් ඇති විය.' }, { quoted: msg });
             }
         } catch (e) {
             console.error(e);
-            await sock.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: mek });
+            await socket.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: msg });
         }
         break;
     }
 
     case 'fitgirl':
     case 'fg': {
+        const q = args.join(' ').trim();
         try {
-            if (!q) return await sock.sendMessage(from, { text: '❌ කරුණාකර සෙවිය යුතු ක්‍රීඩාවේ නමක් සඳහන් කරන්න!\nඋදා: `.fitgirl far cry`' }, { quoted: mek });
+            if (!q) return await socket.sendMessage(from, { text: '❌ කරුණාකර සෙවිය යුතු ක්‍රීඩාවේ නමක් සඳහන් කරන්න!\nඋදා: `.fitgirl far cry`' }, { quoted: msg });
 
             const searchUrl = `https://api-siteh-22e22e4cb068.herokuapp.com/fitgirl/search?game=${encodeURIComponent(q)}`;
             const response = await axios.get(searchUrl);
@@ -11692,19 +13711,22 @@ case 'news':
                 });
                 txt += "*සම්පූර්ණ විස්තර බැලීමට .fginfo [game name] භාවිතා කරන්න.*";
 
-                await sock.sendMessage(from, { text: txt }, { quoted: mek });
+                await socket.sendMessage(from, { text: txt }, { quoted: msg });
+            } else {
+                await socket.sendMessage(from, { text: '❌ ප්‍රතිඵල හමු නොවීය.' }, { quoted: msg });
             }
         } catch (e) {
             console.error(e);
-            await sock.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: mek });
+            await socket.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: msg });
         }
         break;
     }
 
     case 'fginfo':
     case 'fitgirlinfo': {
+        const q = args.join(' ').trim();
         try {
-            if (!q) return await sock.sendMessage(from, { text: '❌ කරුණාකර game එකේ නම නිවැරදිව ලබා දෙන්න!\nඋදා: `.fginfo far cry 5`' }, { quoted: mek });
+            if (!q) return await socket.sendMessage(from, { text: '❌ කරුණාකර game එකේ නම නිවැරදිව ලබා දෙන්න!\nඋදා: `.fginfo far cry 5`' }, { quoted: msg });
 
             const infoUrl = `https://api-siteh-22e22e4cb068.herokuapp.com/fitgirl/complete?game=${encodeURIComponent(q)}`;
             const response = await axios.get(infoUrl);
@@ -11721,16 +13743,16 @@ case 'news':
                               `🏷️ *Categories:* ${g.categories.join(', ')}\n` +
                               `📅 *Published:* ${g.published_date}`;
 
-                await sock.sendMessage(from, { 
+                await socket.sendMessage(from, { 
                     image: { url: g.poster }, 
                     caption: caption 
-                }, { quoted: mek });
+                }, { quoted: msg });
             } else {
-                await sock.sendMessage(from, { text: '❌ අදාළ ක්‍රීඩාවේ තොරතුරු ලබා ගැනීමට නොහැකි විය.' }, { quoted: mek });
+                await socket.sendMessage(from, { text: '❌ අදාළ ක්‍රීඩාවේ තොරතුරු ලබා ගැනීමට නොහැකි විය.' }, { quoted: msg });
             }
         } catch (e) {
             console.error(e);
-            await sock.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: mek });
+            await socket.sendMessage(from, { text: '❌ දෝෂයක් සිදු විය: ' + e.message }, { quoted: msg });
         }
         break;
     } 
@@ -12005,73 +14027,67 @@ case 'pair': {
 // 🆕 SUBSCRIPTION MANAGEMENT (.add) - master owner witharai use karanna one
 // ==========================================
 case 'add': {
-    if (!isOwner) {
+    // 🔒 Master owner (94784224161) witharai
+    if (!(config.OWNER_NUMBERS || []).includes(senderNumber)) {
         return await socket.sendMessage(sender, {
             text: "❌ *Master owner witharai use karanna puluwan!*"
         }, { quoted: msg });
     }
-    if (!args.length || !text.includes('|')) {
+    const addP = sessionConfig.PREFIX || config.PREFIX || '.';
+    // ".add 947xxxxxxxx 1"  /  ".add 947xxxxxxxx | 1"  /  ".add 947xxxxxxxx, 3"  (months nathnam 1)
+    const addTokens = args.join(' ').replace(/[|,]/g, ' ').trim().split(/\s+/).filter(Boolean);
+    const targetNumber = (addTokens[0] || '').replace(/[^0-9]/g, '');
+    const months = addTokens[1] ? parseInt(addTokens[1], 10) : 1;
+
+    if (!targetNumber) {
         return await socket.sendMessage(sender, {
-            text: `❌ *Usage:* \`.add <number> | <months>\`\n\n*Example:*\n\`.add 94712345678 | 1\`\n\n_Masa 1ka subscription ekak denna._`
+            text: `❌ *Usage:* \`${addP}add <number> <months>\`\n\n*Example:*\n\`${addP}add 94712345678 1\`\n\`${addP}add 94712345678 | 3\`\n\n_Months nathnam 1ka._`
         }, { quoted: msg });
     }
-
-    const rawInput = text.slice((sessionConfig.PREFIX || '!').length + command.length).trim();
-    const parts = rawInput.split('|');
-    if (parts.length < 2) {
-        return await socket.sendMessage(sender, {
-            text: `❌ *Usage:* \`.add <number> | <months>\``
-        }, { quoted: msg });
+    if (targetNumber.length < 9) {
+        return await socket.sendMessage(sender, { text: `❌ *Invalid number!* Country code ekka denna (94712345678).` }, { quoted: msg });
     }
-
-    const targetNumber = parts[0].trim().replace(/[^0-9]/g, '');
-    const months = parseInt(parts[1].trim());
-
-    if (!targetNumber || targetNumber.length < 9) {
-        return await socket.sendMessage(sender, { text: `❌ *Invalid number!*` }, { quoted: msg });
-    }
-    if (isNaN(months) || months <= 0) {
-        return await socket.sendMessage(sender, { text: `❌ *Invalid months!* Number ekak danna (1, 2, 3...).` }, { quoted: msg });
+    if (isNaN(months) || months <= 0 || months > 60) {
+        return await socket.sendMessage(sender, { text: `❌ *Invalid months!* 1 - 60 athara number ekak danna.` }, { quoted: msg });
     }
 
     try {
-        const targetSession = await Session.findOne({ number: targetNumber }, 'number');
-        if (!targetSession) {
-            return await socket.sendMessage(sender, {
-                text: `❌ *${targetNumber}* mulinma bot eka pair karanna one!\n\n\`.pair ${targetNumber}\` use karanna, nathnam pairing web link eka eyata denna.`
-            }, { quoted: msg });
-        }
-
-        const targetConfig = await loadUserConfig(targetNumber);
+        const targetConfig = await loadUserConfig(targetNumber); // License collection eth merge wela
         const now = Date.now();
         const currentExpiry = targetConfig.LICENSE_EXPIRY ? new Date(targetConfig.LICENSE_EXPIRY).getTime() : 0;
         const baseTime = currentExpiry > now ? currentExpiry : now; // dan active nam eken passe extend karanawa
         const newExpiry = new Date(baseTime);
         newExpiry.setMonth(newExpiry.getMonth() + months);
 
-        const updatedConfig = { ...targetConfig, LICENSE_EXPIRY: newExpiry.toISOString() };
-        await updateUserConfig(targetNumber, updatedConfig);
+        // 1) License eka save (customer pair karala nathnuth wada)
+        await License.findOneAndUpdate(
+            { number: targetNumber },
+            { expiry: newExpiry, updatedAt: new Date() },
+            { upsert: true }
+        );
 
-        // Meema process eke thamayi eyage bot eka active nam, live widihatama update karanawa
-        const liveEntry = activeSockets.get(targetNumber);
-        if (liveEntry) {
-            liveEntry.config = updatedConfig;
-            activeSockets.set(targetNumber, liveEntry);
-        }
+        // 2) Customer kalin pair karala nam session config ekathuth update karanawa
+        const hasSession = await Session.exists({ number: targetNumber });
+        const updatedConfig = { ...targetConfig, LICENSE_EXPIRY: newExpiry.toISOString() };
+        if (hasSession) await updateUserConfig(targetNumber, updatedConfig);
+
+        // 3) Bot eka dan run wenawa nam IKMANATA apply karanawa (5 min inna one na)
+        let liveNow = false;
+        const pusher = configPushers.get(targetNumber);
+        if (pusher) { pusher(updatedConfig); liveNow = true; }
 
         await socket.sendMessage(sender, {
-            text: `✅ *Subscription Added!*\n\n📱 *Number:* ${targetNumber}\n📅 *Months:* ${months}\n⏳ *Expires:* ${newExpiry.toDateString()}`
+            text: `✅ *Subscription Added!*\n\n📱 *Number:* ${targetNumber}\n📅 *Months:* ${months}\n⏳ *Expires:* ${newExpiry.toDateString()}\n\n${liveNow ? '⚡ Bot eka dan run wenawa, ikmanata active kala.' : hasSession ? '🕒 Bot eka dan offline. Online unama active wenawa.' : '🔗 Me number eka thawa pair karala na. Pair karapu gaman subscription eka active wenawa.'}`
         }, { quoted: msg });
 
         // Customer ta notify karanawa
         try {
             await socket.sendMessage(`${targetNumber}@s.whatsapp.net`, {
-                text: `🎉 *Subscription Activated!*\n\nOyage bot eka dan *active*! ✅\n\n⏳ *Expires:* ${newExpiry.toDateString()}\n\n_Bot eka dan free widihata use karanna puluwan._`
+                text: `🎉 *Subscription Activated!*\n\nOyage bot eka dan *active*! ✅\n\n⏳ *Expires:* ${newExpiry.toDateString()}\n\n_.menu kiyala danna balanna._`
             });
         } catch (notifyErr) {
-            // number eka bot ekakma nam notify wenne nathi wenna puluwan, ok tibenna denna
+            // notify wenne nathi wenna puluwan, ok
         }
-
     } catch (err) {
         console.error('.add command error:', err.message);
         await socket.sendMessage(sender, { text: `❌ Error: ${err.message}` }, { quoted: msg });
@@ -12095,7 +14111,7 @@ case 'subscription': {
     const expiryStr = sessionConfig.LICENSE_EXPIRY;
     if (!expiryStr) {
         return await socket.sendMessage(sender, {
-            text: `⛔ *No Active Subscription*\n\nOwner ta contact karala subscribe karanna.\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
+            text: `⛔ *Payment Required!*\n\nActive subscription ekak nathi. *Pay karala ganna* owner ta contact karanna.\n👑 wa.me/${(config.OWNER_NUMBERS || [])[0] || ''}`
         }, { quoted: msg });
     }
 
@@ -12132,6 +14148,30 @@ case 'accesskey': {
 // ==========================================
 // SYSTEM CONFIGURATION & MONGODB SETTING COMMAND (.set)
 // ==========================================
+case 'button':
+case 'buttons': {
+    if (!isOwner) {
+        return await socket.sendMessage(sender, { text: '❌ *Only the bot owner can use this command.*' }, { quoted: msg });
+    }
+    if (!buttonAllowed()) {
+        return await socket.sendMessage(sender, { text: buttonLockedMsg }, { quoted: msg });
+    }
+    const opt = (args[0] || '').toLowerCase();
+    const P2 = sessionConfig.PREFIX || config.PREFIX || '.';
+    if (!['on', 'off'].includes(opt)) {
+        return await socket.sendMessage(sender, {
+            text: `🔘 *BUTTON MODE :* ${sessionConfig.BUTTON_MODE === 'true' ? 'ON ✅' : 'OFF ❌'}\n\n_${P2}button on_  — buttons ON\n_${P2}button off_ — number reply mode`
+        }, { quoted: msg });
+    }
+    sessionConfig = { ...sessionConfig, BUTTON_MODE: opt === 'on' ? 'true' : 'false' };
+    await updateUserConfig(sanitizedNumber, sessionConfig);
+    activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
+    await socket.sendMessage(sender, {
+        text: `🔘 *Button Mode ${opt === 'on' ? 'ON ✅' : 'OFF ❌'}*\n\n_${opt === 'on' ? 'Dan list / number replies buttons widihata enawa.' : 'Dan wenas kalaa numbers reply karala use karanna.'}_`
+    }, { quoted: msg });
+    break;
+}
+
 case 'set':
 case 'setting': {
     if (!isOwner) {
@@ -12140,70 +14180,83 @@ case 'setting': {
         }, { quoted: msg });
     }
 
-    if (!args.length) {
-        let helpText = `🎀 *𝗦𝗬𝗦𝗧𝗘𝗠  𝗖𝗢𝗡𝗙𝗜𝗚𝗨𝗥𝗔𝗧𝗜𝗢𝗡  𝗣𝗔𝗡𝗘𝗟*\n\n` +
-            `📝 *𝖴𝗌𝖺𝗀𝖾 :* \`.set KEY:VALUE\`\n` +
-            `✨ *𝖤𝗑𝖺𝗆𝗉𝗅𝖾 :* \`.set ALWAYS_ONLINE:true\`\n` +
-            `🫧 *𝖬𝗎𝗅𝗍𝗂 :* \`.set ALWAYS_ONLINE:true,AUTO_RECORDING:true\`\n\n` +
-            `🐞 *𝖠𝗏𝖺𝗂𝗅𝖺𝖻𝗅ե  𝖲𝗒𝗌𝗍𝖾𝗆  𝖪𝖾𝗒𝗌 :*\n` +
-            `🐞 \`ALWAYS_ONLINE\` (true/false)\n` +
-            `🐞 \`ALWAYS_MSG_SEEN\` (true/false)\n` +
-            `🐞 \`AUTO_RECORDING\` (true/false)\n` +
-            `🐞 \`AUTO_TYPING\` (true/false)\n` +
-            `🐞 \`STATUS_VIEW\` (true/false)\n` +
-            `🐞 \`AUTO_LIKE\` (true/false)\n` +
-            `🐞 \`ANTI_DELETE\` (true/false)\n` +
-            `🐞 \`MOVIE_FOOTER\`\n` +
-            `🐞 \`MOVIE_CAPTION\`\n` +
-            `🐞 \`BOT_NAME\`\n` +
-            `🐞 \`BOT_IMAGE\`\n` +
-            `🐞 \`BOT_FOOTER\`\n` +
-            `🐞 \`AIR_FOOTER\`\n` +
-            `🐞 \`PREFIX\`\n` +
-            `🐞 \`MODE\` (public/private)\n`;
+    const validKeys = [
+        'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
+        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
+        'ANTI_DELETE', 'BUTTON_MODE', 'MOVIE_FOOTER', 'MOVIE_CAPTION', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
+    ];
+    const BOOL_KEYS = ['AUTO_RECORDING', 'AUTO_TYPING', 'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE', 'ANTI_DELETE', 'BUTTON_MODE'];
 
+    if (!args.length) {
+        const P3 = sessionConfig.PREFIX || config.PREFIX || '.';
+        const v = (k) => sessionConfig[k] ?? config[k] ?? '';
+        const sw = (k) => (String(v(k)) === 'true' ? '✅' : '❌');
+        const short = (t) => { t = String(t || '-').replace(/\s+/g, ' '); return t.length > 34 ? t.slice(0, 33) + '…' : t; };
+        const dash =
+`╭━━━〔 ⚙️ *𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦* ⚙️ 〕━━━╮
+┃
+┃ 🤖 *Name*     : ${short(v('BOT_NAME'))}
+┃ 🔣 *Prefix*   : ${v('PREFIX') || '.'}
+┃ 🌐 *Mode*     : ${v('MODE') || 'public'}
+┃
+┃ ${sw('ALWAYS_ONLINE')} ALWAYS_ONLINE
+┃ ${sw('ALWAYS_MSG_SEEN')} ALWAYS_MSG_SEEN
+┃ ${sw('AUTO_TYPING')} AUTO_TYPING
+┃ ${sw('AUTO_RECORDING')} AUTO_RECORDING
+┃ ${sw('STATUS_VIEW')} STATUS_VIEW
+┃ ${sw('AUTO_LIKE')} AUTO_LIKE
+┃ ${sw('ANTI_DELETE')} ANTI_DELETE
+┃ ${buttonAllowed() ? sw('BUTTON_MODE') : '🔒'} BUTTON_MODE
+┃
+╰━━━━━━━━━━━━━━━━━━━━╯
+
+📝 *Use :* \`${P3}set KEY:VALUE\`
+✨ \`${P3}set ANTI_DELETE:on\`
+🫧 \`${P3}set PREFIX:!, MODE:private\`
+
+🔤 *Text keys:* BOT_NAME, BOT_FOOTER, MOVIE_FOOTER, MOVIE_CAPTION, BOT_IMAGE (link)
+🌐 *MODE:* public / private / inbox / groups
+⚡ _Wenas kirim ikmanata apply wenawa._`;
         return await socket.sendMessage(sender, {
-            image: { url: config.BOT_IMAGE || config.ERROR },
-            caption: formatMessage(
-                `𝗖𝗢𝗡𝗙𝗜𝗚  𝗠𝗔𝗡𝗔𝗚𝗘𝗥  ⚙️`,
-                helpText,
-                `${sessionConfig.AIR_FOOTER || config.AIR_FOOTER}`
-            )
+            image: { url: pickBotImage(sessionConfig) },
+            caption: dash + `\n\n> 🎭 *SHAGGY XMD* 🎭`
         }, { quoted: msg });
     }
 
     const input = args.join(' ');
     const updates = {};
-    const validKeys = [
-        'PREFIX', 'AUTO_RECORDING', 'AUTO_TYPING', 'MODE', 'JID',
-        'ALWAYS_ONLINE', 'ALWAYS_MSG_SEEN', 'STATUS_VIEW', 'AUTO_LIKE',
-        'ANTI_DELETE', 'MOVIE_FOOTER', 'MOVIE_CAPTION', 'BOT_NAME', 'BOT_IMAGE', 'BOT_FOOTER', 'AIR_FOOTER'
-    ];
-
-    const pairs = input.split(',');
+    // comma eken wen karanne "KEY:" ekak pahalin enawa nam witharai (text values wala comma thiyenna puluwan)
+    const pairs = input.split(/,(?=\s*[A-Za-z_]+\s*:)/);
     let hasInvalidKey = false;
     let invalidKeyName = '';
+    let problem = '';
 
-    pairs.forEach(pair => {
-        let [key, ...valueParts] = pair.split(':');
-        if (!key || valueParts.length === 0) return;
+    for (const pair of pairs) {
+        const idx = pair.indexOf(':');
+        if (idx === -1) continue;
+        const key = pair.slice(0, idx).trim().toUpperCase();
+        let value = pair.slice(idx + 1).trim();
+        if (!validKeys.includes(key)) { hasInvalidKey = true; invalidKeyName = key; continue; }
 
-        key = key.trim().toUpperCase();
-        let value = valueParts.join(':').trim();
-
-        if (validKeys.includes(key)) {
-            if (value.toLowerCase() === 'true') {
-                updates[key] = 'true';
-            } else if (value.toLowerCase() === 'false') {
-                updates[key] = 'false';
-            } else {
-                updates[key] = value;
-            }
-        } else {
-            hasInvalidKey = true;
-            invalidKeyName = key;
+        if (BOOL_KEYS.includes(key)) {
+            const lv = value.toLowerCase();
+            if (['true', 'on', 'yes', '1'].includes(lv)) value = 'true';
+            else if (['false', 'off', 'no', '0'].includes(lv)) value = 'false';
+            else { problem = `\`${key}\` ekata *on / off* (ho true / false) denna.`; break; }
+            if (key === 'BUTTON_MODE' && value === 'true' && !buttonAllowed()) { problem = buttonLockedMsg; break; }
+        } else if (key === 'MODE') {
+            value = value.toLowerCase();
+            if (!['public', 'private', 'inbox', 'groups'].includes(value)) { problem = '`MODE` = public / private / inbox / groups'; break; }
+        } else if (key === 'PREFIX') {
+            if (!value || value.length > 3) { problem = '`PREFIX` eka characters 1-3ka wenna one.'; break; }
+        } else if (key === 'BOT_IMAGE') {
+            if (value && !/^https?:\/\//i.test(value)) { problem = '`BOT_IMAGE` eka http/https link ekak wenna one.'; break; }
         }
-    });
+        updates[key] = value;
+    }
+    if (problem) {
+        return await socket.sendMessage(sender, { text: `❌ ${problem}` }, { quoted: msg });
+    }
 
     if (hasInvalidKey) {
         return await socket.sendMessage(sender, {
@@ -12222,17 +14275,7 @@ case 'setting': {
         sessionConfig = { ...sessionConfig, ...updates };
 
         // MongoDB වෙත ඩේටා නිවැරදිව සේව් වීම සඳහා updateUserConfig හෝ Mongoose Model එක හරහා ස්ථිරවම Save කරයි
-        if (typeof updateUserConfig === 'function') {
-            await updateUserConfig(sanitizedNumber, sessionConfig);
-        } else {
-            // ද බෝට්ගේ වෙනත් කෝඩ් එකක Model එක හරහා Save වන ආකාරය (მაგ: BotModel.findOneAndUpdate)
-            const BotModel = require('./database/model'); // උඹේ ප්‍රොජෙක්ට් එකේ හැටියට මොඩල් පේජ් එක මෙතැනට සෙට් කරගන්න පුළුවන්
-            await BotModel.findOneAndUpdate(
-                { id: sanitizedNumber },
-                { $set: sessionConfig },
-                { upsert: true, new: true }
-            );
-        }
+        await updateUserConfig(sanitizedNumber, sessionConfig);
 
         // Active Sockets වලට අලුත් කොන්ෆිග් එක රියල්-ටයිම් ලෝඩ් කිරීම
         activeSockets.set(sanitizedNumber, { socket, config: sessionConfig });
@@ -12391,7 +14434,13 @@ async function loadUserConfig(number) {
     try {
         const sanitizedNumber = number.replace(/[^0-9]/g, '');
         const configDoc = await Session.findOne({ number: sanitizedNumber }, 'config');
-        return { ...config, ...configDoc?.config };
+        const merged = { ...config, ...configDoc?.config };
+        // .add eken dunna license eka (License collection) session config ekata merge karanawa
+        const lic = await License.findOne({ number: sanitizedNumber }, 'expiry');
+        const a = merged.LICENSE_EXPIRY ? new Date(merged.LICENSE_EXPIRY).getTime() : 0;
+        const b = lic?.expiry ? new Date(lic.expiry).getTime() : 0;
+        if (b > a) merged.LICENSE_EXPIRY = new Date(b).toISOString();
+        return merged;
     } catch (error) {
         console.error(`Failed to load config for ${number}:`, error);
         return { ...config };
@@ -12399,8 +14448,8 @@ async function loadUserConfig(number) {
 }
 
 async function updateUserConfig(number, newConfig) {
+    const sanitizedNumber = number.replace(/[^0-9]/g, '');
     try {
-        const sanitizedNumber = number.replace(/[^0-9]/g, '');
         await Session.findOneAndUpdate(
             { number: sanitizedNumber },
             { config: newConfig, updatedAt: new Date() },
@@ -12558,7 +14607,7 @@ async function EmpirePair(number, res) {
 
                     // Welcome Message
                     await socket.sendMessage(userJid, {
-                        image: { url: sessionConfig.BOT_IMAGE || config.BOT_IMAGE },
+                        image: { url: pickBotImage(sessionConfig) },
                         caption: formatMessage(
                             '✨ *Bot Activated!*',
                             `📱 *Number:* ${sanitizedNumber}
@@ -12584,6 +14633,12 @@ _Bot eke Name/Image/Footer/Movie Footer/Online-Offline/Auto-Like/Auto-Seen/Anti-
         if (!res.headersSent) res.status(503).send({ error: 'Service Unavailable' });
     }
 }
+
+// 🌐 Home page status (main.html)
+router.get('/status', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ online: true, bots: activeSockets.size, uptime: Math.floor(process.uptime()), version: 'v4' });
+});
 
 router.get('/', async (req, res) => {
     const { number } = req.query;
